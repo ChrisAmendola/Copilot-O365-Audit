@@ -178,20 +178,30 @@ Microsoft first-party inbound apps are **excluded by default** (noisy). Pass `-I
 Reports include (among others):
 
 - AppId, display name, home tenant id, verified publisher
-- Requested / assigned Graph permissions (application + delegated), with **high-risk** highlights (`Directory.ReadWrite.All`, `RoleManagement.ReadWrite.Directory`, `Exchange.ManageAsApp`, etc.)
+- **Outbound:** requested permissions from `requiredResourceAccess` (application + delegated), with high-risk highlights
+- **Inbound service principals:** granted **application permissions** (`appRoleAssignments`), **delegated scopes** split by **admin consent** (`consentType=AllPrincipals`) vs **user consent** (`consentType=Principal`), **Entra directory roles**, **owners/admins**, and **assigned users/groups** (`appRoleAssignedTo`)
 - Certificate vs client-secret counts; expired / expiring-in-30-days credentials
 - Redirect / reply URI issues (`http://`, wildcards, localhost)
 - Owner count (outbound), account enabled (inbound)
-- Inbound app-role assignment and oauth2PermissionGrant counts
 - Severity (`High` / `Medium` / `Low`) and human-readable `SecurityNotes`
+- HTML/CSV columns include `AdminConsentPermissions`, `UserConsentPermissions`, `AdminConsentDelegatedScopes`, `UserConsentDelegatedScopes`
 
 ### Run
 
-Delegated (Application Administrator / Global Reader with `Application.Read.All` consent):
+Delegated (needs `Application.Read.All` and related read scopes).
+
+**Cursor / VS Code:** `Connect-MgGraph -UseDeviceCode` often prints the code via `Console.WriteLine`, which the IDE terminal swallows. This script uses a custom device-code callback (`Write-Host`) so the code should appear in-terminal. If it still does not, run the **entire** audit in an external window (Graph sessions are per-process — connecting elsewhere does not help Cursor):
 
 ```powershell
-cd .\B2Btesting
-.\Audit-MultiTenantApps.ps1 -TenantId contoso.com
+# Windows Terminal / external pwsh:
+cd 'D:\Powershell stuff\Copilot O365 Audit\B2Btesting'
+.\Audit-MultiTenantApps.ps1 -TenantId contoso.com -DeviceCode -SkipExternalRelaunch
+```
+
+In Cursor (preferred attempt):
+
+```powershell
+.\Audit-MultiTenantApps.ps1 -TenantId contoso.com -DeviceCode
 ```
 
 App-only (e.g. after Global Reader example helper, against BB):
@@ -201,7 +211,7 @@ App-only (e.g. after Global Reader example helper, against BB):
 .\Audit-MultiTenantApps.ps1 -TenantId '<BB-TENANT-ID>' -AppOnly
 ```
 
-Graph scopes used (delegated): `Application.Read.All`, `Directory.Read.All`, `AppRoleAssignment.Read.All`, `DelegatedPermissionGrant.Read.All`.
+Graph scopes used (delegated): `Application.Read.All`, `Directory.Read.All`, `DelegatedPermissionGrant.Read.All` (app role assignments are covered by Application/Directory read).
 
 ### Outputs
 
