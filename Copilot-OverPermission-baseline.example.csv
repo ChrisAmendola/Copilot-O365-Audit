@@ -1,0 +1,6 @@
+UserPrincipalName,ResourceType,ResourceId,ExpectedRole
+jsmith@contoso.com,Group,Finance-Readers,Member
+jsmith@contoso.com,Group,a1b2c3d4-e5f6-7890-abcd-ef1234567890,Member
+jsmith@contoso.com,Team,Marketing Team,Member
+jsmith@contoso.com,Site,https://contoso.sharepoint.com/sites/Finance,Read
+jdoe@contoso.com,Group,HR-All-Staff,Member
