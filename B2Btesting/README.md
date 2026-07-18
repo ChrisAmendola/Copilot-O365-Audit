@@ -173,18 +173,35 @@ Revoking access in BB: remove role assignment, revoke app role assignments, and/
 
 Microsoft first-party inbound apps are **excluded by default** (noisy). Pass `-IncludeMicrosoftFirstParty` to include them.
 
+### Where it looks for service-principal access
+
+The audit correlates several Entra/Graph surfaces per inbound service principal (Azure RBAC/ARM is **not** covered — enumerate that separately with `Get-AzRoleAssignment`):
+
+| Access source | Graph surface |
+| --- | --- |
+| Application permissions | `servicePrincipals/{id}/appRoleAssignments` |
+| Delegated permissions (admin vs user consent) | `oauth2PermissionGrants` |
+| Active directory roles | `memberOf/microsoft.graph.directoryRole`, `roleManagement/directory/roleAssignments` |
+| **PIM-eligible directory roles** | `roleManagement/directory/roleEligibilityScheduleInstances` |
+| **Security-group memberships** (incl. role-assignable) | `memberOf/microsoft.graph.group` |
+| **Owned objects** (apps/groups it can modify) | `servicePrincipals/{id}/ownedObjects` |
+| Owners / assigned users & groups | `owners`, `appRoleAssignedTo` |
+| Credentials | `keyCredentials` / `passwordCredentials` |
+| **Federated identity credentials** (outbound apps) | `applications/{id}/federatedIdentityCredentials` |
+| **Sign-in evidence** (actual use) | `auditLogs/signIns?$filter=appId eq …` (Entra ID P1) |
+| **Exchange app RBAC + access policies** (`-IncludeExchange`) | `Get-ServicePrincipal`, `Get-ManagementRoleAssignment`, `Get-ApplicationAccessPolicy` |
+
 ### Security fields / risk flags
 
 Reports include (among others):
 
 - AppId, display name, home tenant id, verified publisher
-- **Outbound:** requested permissions from `requiredResourceAccess` (application + delegated), with high-risk highlights
-- **Inbound service principals:** granted **application permissions** (`appRoleAssignments`), **delegated scopes** split by **admin consent** (`consentType=AllPrincipals`) vs **user consent** (`consentType=Principal`), **Entra directory roles**, **owners/admins**, and **assigned users/groups** (`appRoleAssignedTo`)
+- **Outbound:** requested permissions from `requiredResourceAccess` (application + delegated), federated identity credentials, with high-risk highlights
+- **Inbound service principals:** granted **application permissions**, **delegated scopes** split by **admin consent** (`AllPrincipals`) vs **user consent** (`Principal`), active + **PIM-eligible directory roles**, **group memberships**, **owned objects**, owners/admins, assigned users/groups, Exchange app access, and sign-in evidence
 - Certificate vs client-secret counts; expired / expiring-in-30-days credentials
 - Redirect / reply URI issues (`http://`, wildcards, localhost)
-- Owner count (outbound), account enabled (inbound)
 - Severity (`High` / `Medium` / `Low`) and human-readable `SecurityNotes`
-- HTML/CSV columns include `AdminConsentPermissions`, `UserConsentPermissions`, `AdminConsentDelegatedScopes`, `UserConsentDelegatedScopes`
+- Graph calls are wrapped with retry/backoff for throttling (HTTP 429) and transient 5xx
 
 ### Run
 
@@ -211,7 +228,13 @@ App-only (e.g. after Global Reader example helper, against BB):
 .\Audit-MultiTenantApps.ps1 -TenantId '<BB-TENANT-ID>' -AppOnly
 ```
 
-Graph scopes used (delegated): `Application.Read.All`, `Directory.Read.All`, `DelegatedPermissionGrant.Read.All` (app role assignments are covered by Application/Directory read).
+Include Exchange app RBAC and a wider sign-in window:
+
+```powershell
+.\Audit-MultiTenantApps.ps1 -TenantId contoso.com -IncludeExchange -SignInLookbackDays 90
+```
+
+Graph scopes used (delegated): `Application.Read.All`, `Directory.Read.All`, `DelegatedPermissionGrant.Read.All`, `RoleManagement.Read.Directory`, `AuditLog.Read.All`. Use `-SkipSignInActivity` if you lack Entra ID P1, and `-IncludeExchange` (needs the `ExchangeOnlineManagement` module) for Exchange application RBAC / access policies.
 
 ### Outputs
 
@@ -222,8 +245,8 @@ Timestamped folder under `MultiTenantAppAuditOutput\run-yyyyMMdd-HHmmss\`:
 | `multitenant-apps-all.csv` | Combined inventory |
 | `multitenant-apps-outbound.csv` | Multi-tenant app registrations owned here |
 | `multitenant-apps-inbound.csv` | External enterprise apps |
-| `multitenant-apps-report.html` | Summary + top concern rows |
-| `summary.json` | Counts |
+| `multitenant-apps-report.html` | Dashboard + searchable/sortable inbound & outbound tables with collapsible permission lists |
+| `summary.json` | Counts (severity totals, options used) |
 
 ## Relation to `copilot_audit.ps1`
 

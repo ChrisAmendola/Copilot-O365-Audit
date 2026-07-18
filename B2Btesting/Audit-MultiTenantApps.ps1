@@ -43,6 +43,29 @@
 .PARAMETER ForceReconnect
     Ignore any existing Connect-MgGraph session and sign in again.
 
+.PARAMETER IncludeExchange
+    Also probe Exchange Online RBAC-for-Applications and Application Access Policies
+    (requires the ExchangeOnlineManagement module; connects if not already connected).
+
+.PARAMETER ExchangeConnectTimeoutSeconds
+    Auto-skip the Exchange Online connect if sign-in does not complete within this many
+    seconds (default 90). Prevents a swallowed interactive prompt from hanging the audit.
+    Pre-connecting with Connect-ExchangeOnline avoids the timed connect entirely.
+
+.PARAMETER SkipSignInActivity
+    Skip per-app sign-in evidence collection (auditLogs/signIns requires Entra ID P1).
+
+.PARAMETER SignInLookbackDays
+    Days of service-principal sign-in activity to summarize per app (default 30).
+
+.NOTES
+    For each inbound external service principal the audit collects application
+    permissions, delegated grants (admin vs user consent), active and PIM-eligible
+    directory roles, security-group memberships, owned objects, owners, assigned
+    users/groups, credentials, sign-in evidence, and (optionally) Exchange app RBAC.
+    Azure RBAC (ARM) role assignments are NOT covered here — enumerate those with
+    Get-AzRoleAssignment / ARM, since they are not exposed via Microsoft Graph.
+
 .EXAMPLE
     # Prefer: sign in once in an external PowerShell window, then run the audit (reuses session)
     Connect-MgGraph -TenantId contoso.com -Scopes Application.Read.All,Directory.Read.All,DelegatedPermissionGrant.Read.All -UseDeviceCode
@@ -50,6 +73,10 @@
 
 .EXAMPLE
     .\Audit-MultiTenantApps.ps1 -TenantId contoso.com -DeviceCode
+
+.EXAMPLE
+    # Include Exchange app RBAC and a 90-day sign-in window
+    .\Audit-MultiTenantApps.ps1 -TenantId contoso.com -IncludeExchange -SignInLookbackDays 90
 
 .EXAMPLE
     . .\.b2b-global-reader.local.ps1
@@ -74,6 +101,20 @@ param(
     [switch]$DeviceCode,
 
     [switch]$ForceReconnect,
+
+    # Also probe Exchange Online RBAC-for-Applications + Application Access Policies
+    # (requires the ExchangeOnlineManagement module; connects if not already connected).
+    [switch]$IncludeExchange,
+
+    # Auto-skip the Exchange Online connect if a sign-in does not complete in this many
+    # seconds (prevents an interactive prompt from hanging the whole audit).
+    [int]$ExchangeConnectTimeoutSeconds = 90,
+
+    # Skip sign-in log evidence collection (auditLogs/signIns needs Entra ID P1).
+    [switch]$SkipSignInActivity,
+
+    # How many days of sign-in activity to summarize per service principal.
+    [int]$SignInLookbackDays = 30,
 
     # Internal: set when relaunched into an external console from Cursor/VS Code.
     [switch]$SkipExternalRelaunch
@@ -180,6 +221,41 @@ function Test-IsGraphRowObject {
     return ($Object -is [hashtable] -or $Object -is [System.Collections.IDictionary] -or $null -ne $Object.PSObject)
 }
 
+function Invoke-GraphRequestWithRetry {
+    <#
+        Wraps Invoke-MgGraphRequest with retry/backoff for throttling (429) and
+        transient 5xx errors so a single hiccup does not abort a whole collector.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [string]$Method = 'GET',
+        [int]$MaxAttempts = 5
+    )
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return Invoke-MgGraphRequest -Method $Method -Uri $Uri -ErrorAction Stop
+        }
+        catch {
+            $status = $null
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            $isTransient = ($status -eq 429 -or ($status -ge 500 -and $status -le 599))
+            if (-not $isTransient -or $attempt -ge $MaxAttempts) { throw }
+
+            $delay = [Math]::Min(30, [Math]::Pow(2, $attempt))
+            try {
+                $retryAfter = $_.Exception.Response.Headers.RetryAfter.Delta.TotalSeconds
+                if ($retryAfter -and $retryAfter -gt 0) { $delay = [Math]::Min(60, $retryAfter) }
+            }
+            catch { }
+            Write-AuditMsg ("  Graph {0} throttled/transient (HTTP {1}); retry {2}/{3} in {4}s..." -f $Method, $status, $attempt, $MaxAttempts, $delay) Warn
+            Start-Sleep -Seconds ([int]$delay)
+        }
+    }
+}
+
 function Get-GraphPaged {
     param([Parameter(Mandatory)][string]$Uri, [int]$MaxPages = 200)
 
@@ -188,7 +264,7 @@ function Get-GraphPaged {
     $page = 0
     while ($next -and $page -lt $MaxPages) {
         $page++
-        $response = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
+        $response = Invoke-GraphRequestWithRetry -Method GET -Uri $next
         foreach ($v in @((Get-GraphProp -Object $response -Name 'value'))) {
             if ($v) { $items.Add($v) }
         }
@@ -397,6 +473,12 @@ function Start-AuditInExternalConsole {
             '-SkipExternalRelaunch'
         ))
     if ($IncludeMicrosoftFirstParty) { [void]$launchArgs.Add('-IncludeMicrosoftFirstParty') }
+    if ($IncludeExchange) { [void]$launchArgs.Add('-IncludeExchange') }
+    if ($SkipSignInActivity) { [void]$launchArgs.Add('-SkipSignInActivity') }
+    if ($PSBoundParameters.ContainsKey('SignInLookbackDays')) {
+        [void]$launchArgs.Add('-SignInLookbackDays')
+        [void]$launchArgs.Add([string]$SignInLookbackDays)
+    }
     if ($OutputPath) {
         [void]$launchArgs.Add('-OutputPath')
         [void]$launchArgs.Add([string]$OutputPath)
@@ -449,12 +531,16 @@ function Connect-AuditGraph {
     }
     else {
         # AppRoleAssignment.Read.All is not a real Graph scope (AADSTS650053).
-        # Application.Read.All / Directory.Read.All cover appRoleAssignments reads;
-        # DelegatedPermissionGrant.Read.All covers oauth2PermissionGrants.
+        # Application.Read.All / Directory.Read.All cover appRoleAssignments, group
+        # memberships, and owned objects; DelegatedPermissionGrant.Read.All covers
+        # oauth2PermissionGrants; RoleManagement.Read.Directory covers active/eligible
+        # role assignments; AuditLog.Read.All covers sign-in activity evidence.
         $scopes = @(
             'Application.Read.All',
             'Directory.Read.All',
-            'DelegatedPermissionGrant.Read.All'
+            'DelegatedPermissionGrant.Read.All',
+            'RoleManagement.Read.Directory',
+            'AuditLog.Read.All'
         )
         $connectParams = @{
             TenantId  = $TargetTenant
@@ -750,11 +836,38 @@ function Get-AppOwnerCount {
     param([Parameter(Mandatory)][string]$ApplicationObjectId)
 
     try {
-        $owners = @(Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/applications/{0}/owners?`$select=id,displayName" -f $ApplicationObjectId))
-        return @($owners).Count
+        $owners = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/applications/{0}/owners?`$select=id,displayName" -f $ApplicationObjectId))
+        return (Get-ObjectCount $owners)
     }
     catch {
         return -1
+    }
+}
+
+function Get-AppFederatedCredentialSummary {
+    param([Parameter(Mandatory)][string]$ApplicationObjectId)
+
+    # Federated identity credentials = passwordless trust from external IdPs (GitHub Actions,
+    # other clouds, workload identity federation). A secretless path to act as this app.
+    $creds = [System.Collections.Generic.List[string]]::new()
+    try {
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/applications/{0}/federatedIdentityCredentials" -f $ApplicationObjectId))
+    }
+    catch {
+        return [PSCustomObject]@{ CredentialCount = -1; Details = '' }
+    }
+
+    foreach ($c in $rows) {
+        if (-not (Test-IsGraphRowObject $c)) { continue }
+        $name = [string](Get-GraphProp -Object $c -Name 'name')
+        $issuer = [string](Get-GraphProp -Object $c -Name 'issuer')
+        $subject = [string](Get-GraphProp -Object $c -Name 'subject')
+        [void]$creds.Add(('{0} (issuer={1}; subject={2})' -f $name, $issuer, $subject))
+    }
+
+    return [PSCustomObject]@{
+        CredentialCount = $creds.Count
+        Details         = ($creds -join '; ')
     }
 }
 
@@ -771,7 +884,7 @@ function Collect-OutboundMultiTenantApps {
         $filter = [uri]::EscapeDataString("signInAudience eq '$audience'")
         $uri = 'https://graph.microsoft.com/v1.0/applications?$filter={0}&$select=id,appId,displayName,createdDateTime,signInAudience,publisherDomain,verifiedPublisher,info,web,spa,publicClient,keyCredentials,passwordCredentials,requiredResourceAccess,api,isFallbackPublicClient,tags,notes' -f $filter
         try {
-            foreach ($a in @(Get-GraphPaged -Uri $uri)) { $apps.Add($a) }
+            foreach ($a in (ConvertTo-ObjectArray (Get-GraphPaged -Uri $uri))) { $apps.Add($a) }
         }
         catch {
             Write-AuditMsg ("  Filter for {0} failed: {1}" -f $audience, $_.Exception.Message) Warn
@@ -809,6 +922,7 @@ function Collect-OutboundMultiTenantApps {
             -RequiredResourceAccess (Get-GraphProp -Object $app -Name 'requiredResourceAccess') `
             -GraphRoleMap $GraphRoleMap
         $ownerCount = Get-AppOwnerCount -ApplicationObjectId $objectId
+        $ficSummary = Get-AppFederatedCredentialSummary -ApplicationObjectId $objectId
         $fallbackPublic = [bool](Get-GraphProp -Object $app -Name 'isFallbackPublicClient')
         $homepage = [string](Get-GraphProp -Object (Get-GraphProp -Object $app -Name 'info') -Name 'homepage')
 
@@ -818,6 +932,7 @@ function Collect-OutboundMultiTenantApps {
         if ($creds.ExpiredCount -gt 0) { [void]$risk.Add('ExpiredCredentials') }
         if ($creds.Expiring30Count -gt 0) { [void]$risk.Add('CredentialsExpiring30Days') }
         if ($creds.CertCount -eq 0 -and $creds.SecretCount -eq 0) { [void]$risk.Add('NoCredentialsConfigured') }
+        if ($ficSummary.CredentialCount -gt 0) { [void]$risk.Add('FederatedIdentityCredentials') }
         if ($ownerCount -eq 0) { [void]$risk.Add('NoOwners') }
         if ([string]::IsNullOrWhiteSpace($verifiedName)) { [void]$risk.Add('UnverifiedPublisher') }
         if ($audience -eq 'AzureADandPersonalMicrosoftAccount') { [void]$risk.Add('AllowsPersonalMicrosoftAccounts') }
@@ -876,6 +991,18 @@ function Collect-OutboundMultiTenantApps {
                 UserConsentScopeCount            = ''
                 DirectoryRoles                   = ''
                 DirectoryRoleCount               = ''
+                EligibleDirectoryRoles           = ''
+                EligibleDirectoryRoleCount       = ''
+                GroupMemberships                 = ''
+                GroupMembershipCount             = ''
+                OwnedObjects                     = ''
+                OwnedObjectCount                 = ''
+                ExchangeAppAccess                = ''
+                SignInCount                      = ''
+                LastSignIn                       = ''
+                SignInResources                  = ''
+                FederatedCredentials             = $ficSummary.Details
+                FederatedCredentialCount         = $(if ($ficSummary.CredentialCount -ge 0) { $ficSummary.CredentialCount } else { '' })
                 Permissions                      = $permInfo.Permissions
                 AccountEnabled                   = ''
                 AppRoleAssignmentCount           = ''
@@ -887,6 +1014,7 @@ function Collect-OutboundMultiTenantApps {
                         'Multi-tenant app registration owned by this tenant; other tenants can admin-consent it. Permissions listed are requested (requiredResourceAccess), not grants in other tenants.'
                         if ($permInfo.HighRiskCount -gt 0) { 'Requests privileged Graph permissions — review necessity and least privilege.' }
                         if ($creds.SecretCount -gt 0) { 'Client secrets are present; prefer certificates and rotate regularly.' }
+                        if ($ficSummary.CredentialCount -gt 0) { 'Federated identity credentials configured — passwordless external trust; verify issuer/subject.' }
                         if ($ownerCount -eq 0) { 'No owners assigned — ownership/accountability gap.' }
                         if ($audience -eq 'AzureADandPersonalMicrosoftAccount') { 'Also allows personal Microsoft accounts — broader attack surface.' }
                     ) -join ' '
@@ -1198,16 +1326,167 @@ function Get-SpAppRoleAssignedToSummary {
     }
 }
 
+function Get-SpGroupMembershipSummary {
+    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+
+    # Security-group memberships can grant SharePoint/site access, app-role assignments,
+    # or Conditional Access scoping indirectly — a common blind spot.
+    $groups = [System.Collections.Generic.List[string]]::new()
+    try {
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf/microsoft.graph.group?`$select=id,displayName,securityEnabled,isAssignableToRole" -f $ServicePrincipalId))
+    }
+    catch {
+        return [PSCustomObject]@{ GroupCount = -1; RoleAssignableCount = 0; Details = '' }
+    }
+
+    $roleAssignable = 0
+    foreach ($g in $rows) {
+        if (-not (Test-IsGraphRowObject $g)) { continue }
+        $name = [string](Get-GraphProp -Object $g -Name 'displayName')
+        if (-not $name) { continue }
+        $isRoleAssignable = [bool](Get-GraphProp -Object $g -Name 'isAssignableToRole')
+        if ($isRoleAssignable) {
+            $roleAssignable++
+            $name = "$name [role-assignable]"
+        }
+        if (-not ($groups -contains $name)) { [void]$groups.Add($name) }
+    }
+
+    return [PSCustomObject]@{
+        GroupCount          = $groups.Count
+        RoleAssignableCount = $roleAssignable
+        Details             = ($groups -join '; ')
+    }
+}
+
+function Get-SpOwnedObjectsSummary {
+    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+
+    # Objects this SP owns (apps/groups/SPs) — indirect privilege (can add credentials, members).
+    $owned = [System.Collections.Generic.List[string]]::new()
+    try {
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/ownedObjects?`$select=id,displayName" -f $ServicePrincipalId))
+    }
+    catch {
+        return [PSCustomObject]@{ OwnedCount = -1; Details = '' }
+    }
+
+    foreach ($o in $rows) {
+        if (-not (Test-IsGraphRowObject $o)) { continue }
+        $odataType = [string](Get-GraphProp -Object $o -Name '@odata.type')
+        $name = [string](Get-GraphProp -Object $o -Name 'displayName')
+        $kind = ($odataType -replace '#microsoft.graph.', '')
+        if (-not $name) { $name = [string](Get-GraphProp -Object $o -Name 'id') }
+        $label = if ($kind) { '{0} ({1})' -f $name, $kind } else { $name }
+        if ($label -and -not ($owned -contains $label)) { [void]$owned.Add($label) }
+    }
+
+    return [PSCustomObject]@{
+        OwnedCount = $owned.Count
+        Details    = ($owned -join '; ')
+    }
+}
+
+function Get-SpEligibleRoleSummary {
+    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+
+    # PIM-eligible directory roles (not yet active). Requires RoleManagement.Read.Directory
+    # and Entra ID P2; skip gracefully when unavailable.
+    $roles = [System.Collections.Generic.List[string]]::new()
+    try {
+        $filter = [uri]::EscapeDataString("principalId eq '$ServicePrincipalId'")
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?$filter={0}' -f $filter))
+    }
+    catch {
+        return [PSCustomObject]@{ RoleCount = -1; Details = '' }
+    }
+
+    foreach ($r in $rows) {
+        if (-not (Test-IsGraphRowObject $r)) { continue }
+        $roleDefId = [string](Get-GraphProp -Object $r -Name 'roleDefinitionId')
+        $rn = $null
+        if ($roleDefId) {
+            try {
+                $rd = Invoke-GraphRequestWithRetry -Method GET `
+                    -Uri ("https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions/{0}?`$select=displayName" -f $roleDefId)
+                $rn = [string](Get-GraphProp -Object $rd -Name 'displayName')
+            }
+            catch { }
+        }
+        if (-not $rn) { $rn = $roleDefId }
+        if ($rn -and -not ($roles -contains $rn)) { [void]$roles.Add($rn) }
+    }
+
+    return [PSCustomObject]@{
+        RoleCount = $roles.Count
+        Details   = ($roles -join '; ')
+    }
+}
+
+function Get-SpSignInSummary {
+    param(
+        [Parameter(Mandatory)][string]$AppId,
+        [int]$LookbackDays = 30
+    )
+
+    # Evidence of actual use: service-principal (app-only) sign-ins for this appId.
+    # Requires AuditLog.Read.All + Entra ID P1. Returns -1 count when unavailable.
+    if ([string]::IsNullOrWhiteSpace($AppId)) {
+        return [PSCustomObject]@{ SignInCount = -1; LastSignIn = ''; Details = '' }
+    }
+    $since = [DateTime]::UtcNow.AddDays(-[Math]::Abs($LookbackDays)).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $filter = [uri]::EscapeDataString("appId eq '$AppId' and createdDateTime ge $since")
+    $uri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter={0}&$top=100' -f $filter
+
+    try {
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri $uri -MaxPages 5)
+    }
+    catch {
+        return [PSCustomObject]@{ SignInCount = -1; LastSignIn = ''; Details = '' }
+    }
+
+    $count = 0
+    $last = $null
+    $resources = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in $rows) {
+        if (-not (Test-IsGraphRowObject $s)) { continue }
+        $count++
+        $created = [string](Get-GraphProp -Object $s -Name 'createdDateTime')
+        if ($created) {
+            try {
+                $dt = [DateTime]::Parse($created).ToUniversalTime()
+                if (-not $last -or $dt -gt $last) { $last = $dt }
+            }
+            catch { }
+        }
+        $resName = [string](Get-GraphProp -Object $s -Name 'resourceDisplayName')
+        if ($resName -and -not ($resources -contains $resName)) { [void]$resources.Add($resName) }
+    }
+
+    return [PSCustomObject]@{
+        SignInCount = $count
+        LastSignIn  = $(if ($last) { $last.ToString('u') } else { '' })
+        Details     = ($resources -join '; ')
+    }
+}
+
 function Collect-InboundExternalServicePrincipals {
     param(
         [Parameter(Mandatory)][string]$TenantOrgId,
         $GraphRoleMap,
-        [switch]$IncludeMicrosoft
+        [switch]$IncludeMicrosoft,
+        [switch]$CollectSignIns,
+        [int]$SignInLookbackDays = 30,
+        $ExchangeMap
     )
 
     Write-AuditMsg 'Collecting inbound enterprise apps (service principals from other tenants)...'
     $select = 'id,appId,displayName,appOwnerOrganizationId,accountEnabled,createdDateTime,servicePrincipalType,preferredSingleSignOnMode,homepage,replyUrls,keyCredentials,passwordCredentials,verifiedPublisher,publisherName,tags,notes,info'
-    $sps = Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/servicePrincipals?$select={0}' -f $select)
+    $sps = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/servicePrincipals?$select={0}' -f $select))
+    Write-AuditMsg ("  Fetched {0} service principals; scanning for external ones..." -f (Get-ObjectCount $sps))
+    if ((Get-ObjectCount $sps) -le 1) {
+        Write-AuditMsg '  WARNING: only <=1 service principal returned. Every tenant has many first-party SPs, so this usually means the Graph token is stale/expired or lacks Directory.Read.All. Re-run with -ForceReconnect to get a fresh sign-in.' Warn
+    }
 
     $rows = [System.Collections.Generic.List[object]]::new()
     $i = 0
@@ -1220,11 +1499,11 @@ function Collect-InboundExternalServicePrincipals {
         if ($isMs -and -not $IncludeMicrosoft) { continue }
 
         $i++
-        if ($i % 50 -eq 0) { Write-AuditMsg ("  Processed {0} inbound external SPs..." -f $i) }
 
         $spId = [string](Get-GraphProp -Object $sp -Name 'id')
         $appId = [string](Get-GraphProp -Object $sp -Name 'appId')
         $name = [string](Get-GraphProp -Object $sp -Name 'displayName')
+        Write-AuditMsg ("  [{0}] {1} - collecting permissions, roles, memberships..." -f $i, $name)
         $enabled = Get-GraphProp -Object $sp -Name 'accountEnabled'
         $verified = Get-GraphProp -Object $sp -Name 'verifiedPublisher'
         $verifiedName = [string](Get-GraphProp -Object $verified -Name 'displayName')
@@ -1237,8 +1516,22 @@ function Collect-InboundExternalServicePrincipals {
         $roleSummary = Get-SpAppRoleAssignmentSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap
         $grantSummary = Get-SpOauth2GrantSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap
         $dirRoles = Get-SpDirectoryRoleSummary -ServicePrincipalId $spId
+        $eligibleRoles = Get-SpEligibleRoleSummary -ServicePrincipalId $spId
         $ownerSummary = Get-SpOwnerSummary -ServicePrincipalId $spId
         $assignedToSummary = Get-SpAppRoleAssignedToSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap
+        $groupSummary = Get-SpGroupMembershipSummary -ServicePrincipalId $spId
+        $ownedSummary = Get-SpOwnedObjectsSummary -ServicePrincipalId $spId
+        $signInSummary = if ($CollectSignIns) {
+            Write-AuditMsg ("      querying sign-in logs ({0}d)..." -f $SignInLookbackDays)
+            Get-SpSignInSummary -AppId $appId -LookbackDays $SignInLookbackDays
+        }
+        else {
+            [PSCustomObject]@{ SignInCount = -1; LastSignIn = ''; Details = '' }
+        }
+        $exchangeAccess = ''
+        if ($ExchangeMap -and $appId -and $ExchangeMap.ContainsKey($appId.ToLowerInvariant())) {
+            $exchangeAccess = [string]$ExchangeMap[$appId.ToLowerInvariant()]
+        }
 
         $replyUrls = @((Get-GraphProp -Object $sp -Name 'replyUrls') | Where-Object { $_ })
         $redirectFlags = [System.Collections.Generic.List[string]]::new()
@@ -1262,18 +1555,23 @@ function Collect-InboundExternalServicePrincipals {
         if ($adminGrantCount -gt 0) { [void]$risk.Add('HasAdminConsentDelegated') }
         if ($userGrantCount -gt 0) { [void]$risk.Add('HasUserConsentDelegated') }
         if ($dirRoles.RoleCount -gt 0) { [void]$risk.Add('HasDirectoryRoles') }
+        if ($eligibleRoles.RoleCount -gt 0) { [void]$risk.Add('HasEligibleDirectoryRoles') }
         if ($ownerSummary.OwnerCount -eq 0) { [void]$risk.Add('NoOwners') }
         if ($assignedToSummary.AssignmentCount -gt 0) { [void]$risk.Add('HasUserGroupAssignments') }
+        if ($groupSummary.GroupCount -gt 0) { [void]$risk.Add('MemberOfGroups') }
+        if ($groupSummary.RoleAssignableCount -gt 0) { [void]$risk.Add('MemberOfRoleAssignableGroup') }
+        if ($ownedSummary.OwnedCount -gt 0) { [void]$risk.Add('OwnsDirectoryObjects') }
+        if ($exchangeAccess) { [void]$risk.Add('HasExchangeAppRbac') }
         if ($enabled -eq $false) { [void]$risk.Add('DisabledButPresent') }
         if ([string]::IsNullOrWhiteSpace($verifiedName) -and -not $isMs) { [void]$risk.Add('UnverifiedPublisher') }
         if ($creds.SecretCount -gt 0 -or $creds.CertCount -gt 0) { [void]$risk.Add('LocalCredentialsOnSp') }
         foreach ($f in @($redirectFlags | Select-Object -Unique)) { [void]$risk.Add($f) }
 
         $severity = 'Low'
-        if (-not $isMs -and ($highRiskTotal -gt 0 -or $dirRoles.RoleCount -gt 0)) {
+        if (-not $isMs -and ($highRiskTotal -gt 0 -or $dirRoles.RoleCount -gt 0 -or $eligibleRoles.RoleCount -gt 0 -or $groupSummary.RoleAssignableCount -gt 0)) {
             $severity = 'High'
         }
-        elseif (-not $isMs -and ($assignmentCount -gt 0 -or $adminGrantCount -gt 0 -or $userGrantCount -gt 0)) {
+        elseif (-not $isMs -and ($assignmentCount -gt 0 -or $adminGrantCount -gt 0 -or $userGrantCount -gt 0 -or $ownedSummary.OwnedCount -gt 0 -or $exchangeAccess)) {
             $severity = 'Medium'
         }
         elseif ($isMs -and $highRiskTotal -gt 0) {
@@ -1336,6 +1634,18 @@ function Collect-InboundExternalServicePrincipals {
                 UserConsentDelegatedScopes     = $grantSummary.UserConsentScopes
                 DirectoryRoles                 = $dirRoles.Details
                 DirectoryRoleCount             = $(if ($dirRoles.RoleCount -ge 0) { $dirRoles.RoleCount } else { '' })
+                EligibleDirectoryRoles         = $eligibleRoles.Details
+                EligibleDirectoryRoleCount     = $(if ($eligibleRoles.RoleCount -ge 0) { $eligibleRoles.RoleCount } else { '' })
+                GroupMemberships               = $groupSummary.Details
+                GroupMembershipCount           = $(if ($groupSummary.GroupCount -ge 0) { $groupSummary.GroupCount } else { '' })
+                OwnedObjects                   = $ownedSummary.Details
+                OwnedObjectCount               = $(if ($ownedSummary.OwnedCount -ge 0) { $ownedSummary.OwnedCount } else { '' })
+                ExchangeAppAccess              = $exchangeAccess
+                SignInCount                    = $(if ($signInSummary.SignInCount -ge 0) { $signInSummary.SignInCount } else { '' })
+                LastSignIn                     = $signInSummary.LastSignIn
+                SignInResources                = $signInSummary.Details
+                FederatedCredentials           = ''
+                FederatedCredentialCount       = ''
                 Permissions                    = ($permissionsCombined -join ' || ')
                 AccountEnabled                 = $enabled
                 AppRoleAssignmentCount         = $(if ($assignmentCount -ge 0) { $assignmentCount } else { '' })
@@ -1350,8 +1660,14 @@ function Collect-InboundExternalServicePrincipals {
                         if ($userGrantCount -gt 0) { 'Has user-consented delegated permissions (consentType=Principal) — see UserConsentDelegatedPermissions.' }
                         if ($assignmentCount -gt 0) { 'Has application permissions (admin-consent app roles) — see ApplicationPermissions / AdminConsentPermissions.' }
                         if ($dirRoles.RoleCount -gt 0) { 'Assigned Entra directory role(s) — see DirectoryRoles.' }
+                        if ($eligibleRoles.RoleCount -gt 0) { 'PIM-eligible directory role(s) — can be activated on demand; see EligibleDirectoryRoles.' }
+                        if ($groupSummary.RoleAssignableCount -gt 0) { 'Member of a role-assignable group — indirect path to privileged roles.' }
+                        elseif ($groupSummary.GroupCount -gt 0) { 'Member of security group(s) — may inherit app/site access; see GroupMemberships.' }
+                        if ($ownedSummary.OwnedCount -gt 0) { 'Owns directory object(s) — can modify/credential them; see OwnedObjects.' }
+                        if ($exchangeAccess) { 'Has Exchange Online application RBAC/access policy — see ExchangeAppAccess.' }
                         if ($ownerSummary.OwnerCount -eq 0) { 'No owners on this enterprise app — assign an accountable admin.' }
                         if ($assignedToSummary.AssignmentCount -gt 0) { 'Users/groups are assigned to this app — see AssignedPrincipals.' }
+                        if ($signInSummary.SignInCount -eq 0) { 'No app sign-ins in the lookback window — candidate for removal if unused.' }
                         if ($enabled -eq $false) { 'Account disabled but object remains — confirm grants are revoked.' }
                         if ($isMs) { 'Microsoft first-party application (filtered in by -IncludeMicrosoftFirstParty).' }
                     ) -join ' '
@@ -1361,6 +1677,147 @@ function Collect-InboundExternalServicePrincipals {
 
     Write-AuditMsg ("  Inbound external service principals: {0}" -f $rows.Count) Ok
     return , $rows.ToArray()
+}
+
+# Shared EXO query logic. Assumes a live Exchange Online connection in the current
+# runspace. Emits a single hashtable (appId -> access description). Used both in the main
+# runspace (pre-connected) and inside the timed background runspace (fresh connect).
+$Script:ExchangeQueryScript = {
+    $map = @{}
+    $addTo = {
+        param([string]$AppId, [string]$Text)
+        if ([string]::IsNullOrWhiteSpace($AppId) -or [string]::IsNullOrWhiteSpace($Text)) { return }
+        $key = $AppId.ToLowerInvariant()
+        if ($map.ContainsKey($key)) { $map[$key] = ($map[$key] + '; ' + $Text) }
+        else { $map[$key] = $Text }
+    }
+
+    try {
+        $exoSps = @(Get-ServicePrincipal -ErrorAction Stop)
+        foreach ($esp in $exoSps) {
+            $appId = [string]$esp.AppId
+            if (-not $appId) { continue }
+            try {
+                $assignments = @(Get-ManagementRoleAssignment -RoleAssignee $esp.Identity -ErrorAction Stop)
+                $roles = @($assignments | ForEach-Object { [string]$_.Role } | Where-Object { $_ } | Select-Object -Unique)
+                if ($roles.Count -gt 0) { & $addTo $appId ('EXO RBAC roles: ' + ($roles -join ', ')) }
+            }
+            catch { }
+        }
+    }
+    catch { }
+
+    try {
+        $policies = @(Get-ApplicationAccessPolicy -ErrorAction Stop)
+        foreach ($p in $policies) {
+            & $addTo ([string]$p.AppId) ('AppAccessPolicy: {0} scope={1}' -f [string]$p.AccessRight, [string]$p.ScopeName)
+        }
+    }
+    catch { }
+
+    , $map
+}
+
+function Get-ExchangeAppAccessMap {
+    <#
+        Builds a map of appId -> Exchange Online application access description by combining
+        RBAC-for-Applications management-role assignments and Application Access Policies.
+
+        If no EXO session exists, the connect + queries run inside a background runspace with
+        a hard timeout so an interactive sign-in that never surfaces (common in Cursor / VS
+        Code terminals) cannot hang the whole audit. Returns an empty map on any failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TargetTenant,
+        [int]$ConnectTimeoutSeconds = 90
+    )
+
+    $map = @{}
+    if (-not (Get-Module -ListAvailable -Name 'ExchangeOnlineManagement')) {
+        Write-AuditMsg '  -IncludeExchange set but ExchangeOnlineManagement module is not installed; skipping EXO checks.' Warn
+        return $map
+    }
+
+    try {
+        Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    }
+    catch {
+        Write-AuditMsg ("  Could not import ExchangeOnlineManagement; skipping EXO checks: {0}" -f $_.Exception.Message) Warn
+        return $map
+    }
+
+    $connected = $false
+    try {
+        if (Get-ConnectionInformation -ErrorAction SilentlyContinue) { $connected = $true }
+    }
+    catch { }
+
+    # Fast path: an existing session (e.g. user ran Connect-ExchangeOnline first) — query here.
+    if ($connected) {
+        Write-AuditMsg '  Reusing existing Exchange Online connection.' Info
+        try {
+            $result = & $Script:ExchangeQueryScript
+            if ($result -is [hashtable]) { $map = $result }
+        }
+        catch {
+            Write-AuditMsg ("  EXO query failed: {0}" -f $_.Exception.Message) Warn
+        }
+        Write-AuditMsg ("  Exchange app-access entries mapped: {0}" -f $map.Count) Ok
+        return $map
+    }
+
+    # No session: connect + query inside a background runspace we can abandon on timeout.
+    # (EXO cmdlets register per-runspace, so the connect and queries must share one runspace.)
+    $useDevice = [bool]$DeviceCode -or ($env:TERM_PROGRAM -match '(?i)vscode|cursor') -or [bool]$env:CURSOR_TRACE_ID
+    Write-AuditMsg ("  Connecting to Exchange Online (auto-skips after {0}s{1})..." -f $ConnectTimeoutSeconds, $(if ($useDevice) { '; device code' } else { '' })) Info
+
+    $worker = @'
+param($TargetTenant, $UseDevice, $QueryText)
+Import-Module ExchangeOnlineManagement -ErrorAction Stop
+$p = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+if ($TargetTenant) { $p['Organization'] = $TargetTenant }
+$keys = @((Get-Command Connect-ExchangeOnline -ErrorAction Stop).Parameters.Keys)
+if ($UseDevice -and ($keys -contains 'Device')) { $p['Device'] = $true }
+Connect-ExchangeOnline @p | Out-Null
+$sb = [scriptblock]::Create($QueryText)
+& $sb
+try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+'@
+
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript($worker).AddArgument($TargetTenant).AddArgument([bool]$useDevice).AddArgument($Script:ExchangeQueryScript.ToString())
+    $async = $ps.BeginInvoke()
+    $completed = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Max(10, $ConnectTimeoutSeconds)))
+
+    if (-not $completed) {
+        Write-AuditMsg ("  Exchange sign-in did not complete within {0}s; skipping EXO checks. Tip: run Connect-ExchangeOnline in an external window first, then re-run the audit (it reuses the session)." -f $ConnectTimeoutSeconds) Warn
+        try { [void]$ps.Stop() } catch { }
+        try { $ps.Dispose() } catch { }
+        return $map
+    }
+
+    try {
+        $out = $ps.EndInvoke($async)
+        foreach ($o in @($out)) {
+            if ($null -eq $o) { continue }
+            # .psobject is an intrinsic member on every object, so this is StrictMode-safe
+            # and unwraps PSObject-wrapped results back to the underlying hashtable.
+            $candidate = $o.psobject.BaseObject
+            if ($candidate -is [hashtable]) { $map = $candidate; break }
+        }
+        if ($ps.HadErrors -and $ps.Streams.Error.Count -gt 0) {
+            Write-AuditMsg ("  Exchange checks reported: {0}" -f $ps.Streams.Error[0].ToString()) Warn
+        }
+    }
+    catch {
+        Write-AuditMsg ("  Exchange Online connection/query failed; skipping EXO checks: {0}" -f $_.Exception.Message) Warn
+    }
+    finally {
+        try { $ps.Dispose() } catch { }
+    }
+
+    Write-AuditMsg ("  Exchange app-access entries mapped: {0}" -f $map.Count) Ok
+    return $map
 }
 
 function Export-AuditCsv {
@@ -1376,85 +1833,229 @@ function New-HtmlReport {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)]$Org,
-        [Parameter(Mandatory)][object[]]$AllRows,
-        [Parameter(Mandatory)][string]$RunFolder
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AllRows,
+        [Parameter(Mandatory)][string]$RunFolder,
+        [hashtable]$Meta
     )
 
     $outbound = @($AllRows | Where-Object { $_.Direction -eq 'Outbound' })
     $inbound = @($AllRows | Where-Object { $_.Direction -eq 'Inbound' })
     $high = @($AllRows | Where-Object { $_.Severity -eq 'High' })
     $medium = @($AllRows | Where-Object { $_.Severity -eq 'Medium' })
+    $low = @($AllRows | Where-Object { $_.Severity -eq 'Low' })
 
     function Esc([string]$t) {
         if ($null -eq $t) { return '' }
         return [System.Net.WebUtility]::HtmlEncode($t)
     }
 
-    $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine('<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Multi-tenant app audit</title>')
-    [void]$sb.AppendLine('<style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1b1b1b}table{border-collapse:collapse;width:100%;margin:12px 0 28px}th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top}th{background:#f3f3f3;text-align:left}.high{background:#fde7e9}.medium{background:#fff4ce}.muted{color:#666}code{font-size:12px}</style>')
-    [void]$sb.AppendLine('</head><body>')
-    [void]$sb.AppendLine('<h1>Multi-tenant / cross-tenant application audit</h1>')
-    [void]$sb.AppendLine(('<p>Tenant: <strong>{0}</strong> (<code>{1}</code>)<br/>Generated: {2:u}<br/>Output: <code>{3}</code></p>' -f (Esc $Org.DisplayName), (Esc $Org.Id), [DateTime]::UtcNow, (Esc $RunFolder)))
-    [void]$sb.AppendLine('<h2>Summary</h2><ul>')
-    [void]$sb.AppendLine(('<li>Outbound multi-tenant app registrations: <strong>{0}</strong></li>' -f (Get-ObjectCount $outbound)))
-    [void]$sb.AppendLine(('<li>Inbound external enterprise apps (non-home SP): <strong>{0}</strong></li>' -f (Get-ObjectCount $inbound)))
-    [void]$sb.AppendLine(('<li>High severity rows: <strong>{0}</strong></li>' -f (Get-ObjectCount $high)))
-    [void]$sb.AppendLine(('<li>Medium severity rows: <strong>{0}</strong></li>' -f (Get-ObjectCount $medium)))
-    [void]$sb.AppendLine('</ul>')
-    [void]$sb.AppendLine('<p class="muted">Outbound = apps this tenant publishes for other tenants to consent (requested permissions). Inbound = apps from other tenants consented into this tenant (granted application permissions, delegated scopes, and Entra directory roles).</p>')
-
-    [void]$sb.AppendLine('<h2>Highest concern rows</h2>')
-    [void]$sb.AppendLine('<table><tr><th>Severity</th><th>Direction</th><th>DisplayName</th><th>AppId</th><th>RiskFlags</th><th>Admin consent permissions</th><th>User consent permissions</th><th>Directory roles</th><th>Owners / admins</th><th>Notes</th></tr>')
-    foreach ($r in @($AllRows | Sort-Object @{ Expression = { switch ($_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, DisplayName | Select-Object -First 75)) {
-        $cls = switch ($r.Severity) { 'High' { 'high' } 'Medium' { 'medium' } default { '' } }
-        [void]$sb.AppendLine(('<tr class="{0}"><td>{1}</td><td>{2}</td><td>{3}</td><td><code>{4}</code></td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td></tr>' -f `
-                $cls,
-                (Esc $r.Severity),
-                (Esc $r.Direction),
-                (Esc $r.DisplayName),
-                (Esc $r.AppId),
-                (Esc $r.RiskFlags),
-                (Esc $(if ($r.AdminConsentPermissions) { $r.AdminConsentPermissions } else { '—' })),
-                (Esc $(if ($r.UserConsentPermissions) { $r.UserConsentPermissions } else { '—' })),
-                (Esc $(if ($r.DirectoryRoles) { $r.DirectoryRoles } else { '—' })),
-                (Esc $(if ($r.Owners) { $r.Owners } else { '—' })),
-                (Esc $r.SecurityNotes)))
+    # Render a possibly-long, delimited value as a collapsible list; '—' when empty.
+    function Format-CollapsibleCell {
+        param([string]$Value, [string]$Delimiter = ';')
+        if ([string]::IsNullOrWhiteSpace($Value)) { return '<span class="muted">&mdash;</span>' }
+        $parts = @($Value -split [regex]::Escape($Delimiter) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($parts.Count -le 1) { return ('<span>{0}</span>' -f (Esc ($parts -join ''))) }
+        $items = ($parts | ForEach-Object { '<li>{0}</li>' -f (Esc $_) }) -join ''
+        return ('<details><summary>{0} items</summary><ul class="cell-list">{1}</ul></details>' -f $parts.Count, $items)
     }
-    [void]$sb.AppendLine('</table>')
 
-    [void]$sb.AppendLine('<h2>Inbound service principals — admin consent vs user consent</h2>')
-    [void]$sb.AppendLine('<table><tr><th>DisplayName</th><th>AppId</th><th>Severity</th><th>Admin consent (app roles + AllPrincipals delegated)</th><th>User consent (Principal delegated)</th><th>Admin scopes</th><th>User scopes</th><th>Directory roles</th><th>Owners</th><th>Assigned users/groups</th></tr>')
-    $inboundSorted = @(
-        $inbound | Sort-Object @{ Expression = { switch ($_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, DisplayName
-    )
-    if ((Get-ObjectCount $inboundSorted) -eq 0) {
-        [void]$sb.AppendLine('<tr><td colspan="10" class="muted">No inbound external service principals in this run.</td></tr>')
+    function Format-RiskPills {
+        param([string]$Flags)
+        if ([string]::IsNullOrWhiteSpace($Flags)) { return '<span class="muted">&mdash;</span>' }
+        $sb2 = [System.Text.StringBuilder]::new()
+        foreach ($f in @($Flags -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            $hot = if ($f -match '(?i)HighRisk|RoleAssignable|DirectoryRoles|Eligible|OwnsDirectory|FederatedIdentity|NoOwners') { ' pill-hot' } else { '' }
+            [void]$sb2.Append(('<span class="pill{0}">{1}</span>' -f $hot, (Esc $f)))
+        }
+        return $sb2.ToString()
+    }
+
+    function Get-SevBadge {
+        param([string]$Severity)
+        $cls = switch ($Severity) { 'High' { 'sev-high' } 'Medium' { 'sev-med' } default { 'sev-low' } }
+        return ('<span class="badge {0}">{1}</span>' -f $cls, (Esc $Severity))
+    }
+
+    $css = @'
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1b1f24;--muted:#6b7280;--line:#e3e6ea;--brand:#2b579a;--high:#c62828;--med:#b26a00;--low:#2e7d32}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:var(--ink);font-size:14px;line-height:1.45}
+.wrap{max-width:1500px;margin:0 auto;padding:24px}
+header.top{background:linear-gradient(135deg,#2b579a,#1e3c6e);color:#fff;padding:24px 28px;border-radius:14px;box-shadow:0 6px 20px rgba(30,60,110,.25)}
+header.top h1{margin:0 0 6px;font-size:22px}
+header.top .meta{opacity:.9;font-size:13px}
+header.top code{background:rgba(255,255,255,.18);padding:1px 6px;border-radius:5px;color:#fff}
+.cards{display:flex;flex-wrap:wrap;gap:14px;margin:22px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;min-width:150px;flex:1;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.card .n{font-size:30px;font-weight:700;line-height:1}
+.card .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-top:6px}
+.card.high .n{color:var(--high)}.card.med .n{color:var(--med)}.card.low .n{color:var(--low)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 14px;color:var(--muted);font-size:12px}
+.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600;color:#fff}
+.sev-high{background:var(--high)}.sev-med{background:var(--med)}.sev-low{background:var(--low)}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:16px 0}
+.controls input,.controls select{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;background:#fff}
+.controls input[type=search]{min-width:280px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px 0;margin:18px 0;overflow:hidden}
+section h2{font-size:16px;margin:14px 18px}
+.tbl-scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+thead th{position:sticky;top:0;background:#eef1f5;text-align:left;padding:10px 12px;border-bottom:2px solid var(--line);cursor:pointer;white-space:nowrap;z-index:1}
+thead th:hover{background:#e3e8ef}
+tbody td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:hover{background:#f8fafc}
+tr.row-high{box-shadow:inset 4px 0 0 var(--high)}
+tr.row-med{box-shadow:inset 4px 0 0 var(--med)}
+tr.row-low{box-shadow:inset 4px 0 0 var(--low)}
+code{font-family:Consolas,Menlo,monospace;font-size:12px;background:#f1f3f5;padding:1px 5px;border-radius:4px}
+.muted{color:var(--muted)}
+.pill{display:inline-block;background:#eef1f5;color:#374151;border:1px solid var(--line);border-radius:20px;padding:1px 8px;margin:2px 3px 2px 0;font-size:11px;white-space:nowrap}
+.pill-hot{background:#fdecec;color:#a01818;border-color:#f3c2c2}
+details summary{cursor:pointer;color:var(--brand);font-size:12px}
+ul.cell-list{margin:6px 0 0;padding-left:18px}
+ul.cell-list li{margin:2px 0}
+.notes{max-width:360px}
+footer{color:var(--muted);font-size:12px;margin:24px 0 8px;text-align:center}
+</style>
+'@
+
+    $js = @'
+<script>
+function auditFilter(sectionId){
+  var sec=document.getElementById(sectionId);
+  var q=(sec.querySelector('.f-search').value||'').toLowerCase();
+  var sev=sec.querySelector('.f-sev').value;
+  var rows=sec.querySelectorAll('tbody tr');
+  var shown=0;
+  rows.forEach(function(r){
+    var okText=!q||r.innerText.toLowerCase().indexOf(q)>-1;
+    var okSev=!sev||r.getAttribute('data-sev')===sev;
+    var vis=okText&&okSev;r.style.display=vis?'':'none';if(vis)shown++;
+  });
+  var c=sec.querySelector('.f-count');if(c)c.textContent=shown+' shown';
+}
+function auditSort(th){
+  var table=th.closest('table');var idx=Array.prototype.indexOf.call(th.parentNode.children,th);
+  var tbody=table.querySelector('tbody');var rows=Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  var asc=th.getAttribute('data-asc')!=='1';th.setAttribute('data-asc',asc?'1':'0');
+  rows.sort(function(a,b){
+    var x=(a.children[idx]?a.children[idx].innerText:'').trim().toLowerCase();
+    var y=(b.children[idx]?b.children[idx].innerText:'').trim().toLowerCase();
+    var nx=parseFloat(x),ny=parseFloat(y);
+    if(!isNaN(nx)&&!isNaN(ny)){return asc?nx-ny:ny-nx;}
+    return asc?x.localeCompare(y):y.localeCompare(x);
+  });
+  rows.forEach(function(r){tbody.appendChild(r);});
+}
+</script>
+'@
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Multi-tenant application audit</title>')
+    [void]$sb.AppendLine($css)
+    [void]$sb.AppendLine('</head><body><div class="wrap">')
+
+    $scopeNote = if ($Meta -and $Meta.ContainsKey('ScopeNote')) { [string]$Meta.ScopeNote } else { '' }
+    $lookback = if ($Meta -and $Meta.ContainsKey('SignInLookbackDays')) { [string]$Meta.SignInLookbackDays } else { '30' }
+    [void]$sb.AppendLine('<header class="top">')
+    [void]$sb.AppendLine('<h1>Multi-tenant / cross-tenant application audit</h1>')
+    [void]$sb.AppendLine(('<div class="meta">Tenant <strong>{0}</strong> &nbsp;|&nbsp; <code>{1}</code><br/>Generated {2:u} &nbsp;|&nbsp; Sign-in lookback: {3} days</div>' -f (Esc $Org.DisplayName), (Esc $Org.Id), [DateTime]::UtcNow, (Esc $lookback)))
+    if ($scopeNote) { [void]$sb.AppendLine(('<div class="meta">{0}</div>' -f (Esc $scopeNote))) }
+    [void]$sb.AppendLine('</header>')
+
+    # Dashboard cards
+    [void]$sb.AppendLine('<div class="cards">')
+    [void]$sb.AppendLine(('<div class="card high"><div class="n">{0}</div><div class="l">High severity</div></div>' -f (Get-ObjectCount $high)))
+    [void]$sb.AppendLine(('<div class="card med"><div class="n">{0}</div><div class="l">Medium severity</div></div>' -f (Get-ObjectCount $medium)))
+    [void]$sb.AppendLine(('<div class="card low"><div class="n">{0}</div><div class="l">Low severity</div></div>' -f (Get-ObjectCount $low)))
+    [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Inbound enterprise apps</div></div>' -f (Get-ObjectCount $inbound)))
+    [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Outbound app registrations</div></div>' -f (Get-ObjectCount $outbound)))
+    [void]$sb.AppendLine('</div>')
+
+    [void]$sb.AppendLine('<div class="legend"><span><span class="badge sev-high">High</span> privileged app perms / directory roles</span><span><span class="badge sev-med">Medium</span> consented perms / owned objects</span><span><span class="badge sev-low">Low</span> presence only</span></div>')
+
+    $sevOrder = { switch ($_.Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } } }
+
+    # ---- Inbound section ----
+    $inboundSorted = @($inbound | Sort-Object @{ Expression = $sevOrder }, DisplayName)
+    [void]$sb.AppendLine('<section id="sec-inbound">')
+    [void]$sb.AppendLine('<h2>Inbound service principals &mdash; permissions, roles &amp; administrators</h2>')
+    [void]$sb.AppendLine('<div class="controls">')
+    [void]$sb.AppendLine('<input type="search" class="f-search" placeholder="Search inbound apps, scopes, owners..." oninput="auditFilter(''sec-inbound'')"/>')
+    [void]$sb.AppendLine('<select class="f-sev" onchange="auditFilter(''sec-inbound'')"><option value="">All severities</option><option>High</option><option>Medium</option><option>Low</option></select>')
+    [void]$sb.AppendLine('<span class="f-count muted"></span>')
+    [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
+    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Severity</th><th onclick="auditSort(this)">DisplayName</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Home tenant</th><th onclick="auditSort(this)">Risk flags</th><th onclick="auditSort(this)">Admin-consent permissions</th><th onclick="auditSort(this)">User-consent permissions</th><th onclick="auditSort(this)">Directory roles</th><th onclick="auditSort(this)">Eligible (PIM) roles</th><th onclick="auditSort(this)">Group memberships</th><th onclick="auditSort(this)">Owned objects</th><th onclick="auditSort(this)">Owners / admins</th><th onclick="auditSort(this)">Assigned users/groups</th><th onclick="auditSort(this)">Exchange access</th><th onclick="auditSort(this)">Sign-ins</th><th onclick="auditSort(this)">Notes</th></tr></thead><tbody>')
+    if ($inboundSorted.Count -eq 0) {
+        [void]$sb.AppendLine('<tr><td colspan="16" class="muted">No inbound external service principals in this run.</td></tr>')
     }
     else {
         foreach ($r in $inboundSorted) {
-            $cls = switch ($r.Severity) { 'High' { 'high' } 'Medium' { 'medium' } default { '' } }
-            $cell = {
-                param($v)
-                if ([string]::IsNullOrWhiteSpace([string]$v)) { '—' } else { [string]$v }
-            }
-            [void]$sb.AppendLine(('<tr class="{0}"><td>{1}</td><td><code>{2}</code></td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td></tr>' -f `
-                    $cls,
+            $rowcls = switch ($r.Severity) { 'High' { 'row-high' } 'Medium' { 'row-med' } default { 'row-low' } }
+            $signInText = if ([string]::IsNullOrWhiteSpace([string]$r.SignInCount)) { '<span class="muted">n/a</span>' } elseif ([int]$r.SignInCount -eq 0) { '<span class="pill pill-hot">0</span>' } else { ('{0}<br/><span class="muted">{1}</span>' -f (Esc $r.SignInCount), (Esc $r.LastSignIn)) }
+            [void]$sb.AppendLine(('<tr class="{0}" data-sev="{1}"><td>{2}</td><td>{3}</td><td><code>{4}</code></td><td><code>{5}</code></td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td><td>{11}</td><td>{12}</td><td>{13}</td><td>{14}</td><td>{15}</td><td>{16}</td><td class="notes">{17}</td></tr>' -f `
+                    $rowcls,
+                    (Esc $r.Severity),
+                    (Get-SevBadge $r.Severity),
                     (Esc $r.DisplayName),
                     (Esc $r.AppId),
-                    (Esc $r.Severity),
-                    (Esc (& $cell $r.AdminConsentPermissions)),
-                    (Esc (& $cell $r.UserConsentPermissions)),
-                    (Esc (& $cell $r.AdminConsentDelegatedScopes)),
-                    (Esc (& $cell $r.UserConsentDelegatedScopes)),
-                    (Esc (& $cell $r.DirectoryRoles)),
-                    (Esc (& $cell $r.Owners)),
-                    (Esc (& $cell $r.AssignedPrincipals))))
+                    (Esc $r.HomeTenantId),
+                    (Format-RiskPills $r.RiskFlags),
+                    (Format-CollapsibleCell $r.AdminConsentPermissions ' || '),
+                    (Format-CollapsibleCell $r.UserConsentPermissions ' || '),
+                    (Format-CollapsibleCell $r.DirectoryRoles ';'),
+                    (Format-CollapsibleCell $r.EligibleDirectoryRoles ';'),
+                    (Format-CollapsibleCell $r.GroupMemberships ';'),
+                    (Format-CollapsibleCell $r.OwnedObjects ';'),
+                    (Format-CollapsibleCell $r.Owners ';'),
+                    (Format-CollapsibleCell $r.AssignedPrincipals ';'),
+                    (Format-CollapsibleCell $r.ExchangeAppAccess ';'),
+                    $signInText,
+                    (Esc $r.SecurityNotes)))
         }
     }
-    [void]$sb.AppendLine('</table>')
-    [void]$sb.AppendLine('<p class="muted">Admin consent = application permissions (appRoleAssignments) plus delegated grants with consentType=AllPrincipals. User consent = delegated grants with consentType=Principal (per-user).</p>')
-    [void]$sb.AppendLine('<p class="muted">Full inventories including counts and risk flags are in the CSV files in the output folder.</p>')
+    [void]$sb.AppendLine('</tbody></table></div>')
+    [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Admin consent = application permissions (appRoleAssignments) + delegated grants with consentType=AllPrincipals. User consent = delegated grants with consentType=Principal (per user). Sign-ins = app-only sign-ins in the lookback window (requires Entra ID P1).</p>')
+    [void]$sb.AppendLine('</section>')
+
+    # ---- Outbound section ----
+    $outboundSorted = @($outbound | Sort-Object @{ Expression = $sevOrder }, DisplayName)
+    [void]$sb.AppendLine('<section id="sec-outbound">')
+    [void]$sb.AppendLine('<h2>Outbound multi-tenant app registrations (owned by this tenant)</h2>')
+    [void]$sb.AppendLine('<div class="controls">')
+    [void]$sb.AppendLine('<input type="search" class="f-search" placeholder="Search outbound apps..." oninput="auditFilter(''sec-outbound'')"/>')
+    [void]$sb.AppendLine('<select class="f-sev" onchange="auditFilter(''sec-outbound'')"><option value="">All severities</option><option>High</option><option>Medium</option><option>Low</option></select>')
+    [void]$sb.AppendLine('<span class="f-count muted"></span>')
+    [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
+    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Severity</th><th onclick="auditSort(this)">DisplayName</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Sign-in audience</th><th onclick="auditSort(this)">Risk flags</th><th onclick="auditSort(this)">Requested permissions</th><th onclick="auditSort(this)">Federated credentials</th><th onclick="auditSort(this)">Owners</th><th onclick="auditSort(this)">Notes</th></tr></thead><tbody>')
+    if ($outboundSorted.Count -eq 0) {
+        [void]$sb.AppendLine('<tr><td colspan="9" class="muted">No outbound multi-tenant app registrations in this run.</td></tr>')
+    }
+    else {
+        foreach ($r in $outboundSorted) {
+            $rowcls = switch ($r.Severity) { 'High' { 'row-high' } 'Medium' { 'row-med' } default { 'row-low' } }
+            [void]$sb.AppendLine(('<tr class="{0}" data-sev="{1}"><td>{2}</td><td>{3}</td><td><code>{4}</code></td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td class="notes">{10}</td></tr>' -f `
+                    $rowcls,
+                    (Esc $r.Severity),
+                    (Get-SevBadge $r.Severity),
+                    (Esc $r.DisplayName),
+                    (Esc $r.AppId),
+                    (Esc $r.SignInAudience),
+                    (Format-RiskPills $r.RiskFlags),
+                    (Format-CollapsibleCell $r.Permissions ';'),
+                    (Format-CollapsibleCell $r.FederatedCredentials ';'),
+                    (Format-CollapsibleCell $r.Owners ';'),
+                    (Esc $r.SecurityNotes)))
+        }
+    }
+    [void]$sb.AppendLine('</tbody></table></div>')
+    [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Outbound permissions are requested (requiredResourceAccess) on the app registration, not grants in consenting tenants.</p>')
+    [void]$sb.AppendLine('</section>')
+
+    [void]$sb.AppendLine('<footer>Full inventories (all columns) are in the CSV files alongside this report. Generated by Audit-MultiTenantApps.ps1</footer>')
+    [void]$sb.AppendLine('</div>')
+    [void]$sb.AppendLine($js)
     [void]$sb.AppendLine('</body></html>')
     [System.IO.File]::WriteAllText($Path, $sb.ToString(), [System.Text.UTF8Encoding]::new($false))
 }
@@ -1473,10 +2074,19 @@ $org = Get-CurrentOrganization
 if ($org.Id) { $resolvedTenantId = $org.Id }
 Write-AuditMsg ("Organization: {0} ({1})" -f $org.DisplayName, $resolvedTenantId) Ok
 
+$exchangeMap = $null
+if ($IncludeExchange) {
+    Write-AuditMsg 'Collecting Exchange Online application RBAC / access policies...'
+    $exchangeMap = Get-ExchangeAppAccessMap -TargetTenant $resolvedTenantId -ConnectTimeoutSeconds $ExchangeConnectTimeoutSeconds
+}
+
+$collectSignIns = -not $SkipSignInActivity
+
 $graphRoleMap = Get-GraphAppRoleValueMap
 $outboundRows = ConvertTo-ObjectArray (Collect-OutboundMultiTenantApps -TenantOrgId $resolvedTenantId -GraphRoleMap $graphRoleMap)
 $inboundRows = ConvertTo-ObjectArray (Collect-InboundExternalServicePrincipals -TenantOrgId $resolvedTenantId -GraphRoleMap $graphRoleMap `
-        -IncludeMicrosoft:$IncludeMicrosoftFirstParty)
+        -IncludeMicrosoft:$IncludeMicrosoftFirstParty `
+        -CollectSignIns:$collectSignIns -SignInLookbackDays $SignInLookbackDays -ExchangeMap $exchangeMap)
 
 $allRowsList = [System.Collections.Generic.List[object]]::new()
 foreach ($r in $outboundRows) { [void]$allRowsList.Add($r) }
@@ -1495,7 +2105,12 @@ $html = Join-Path $runFolder 'multitenant-apps-report.html'
 Export-AuditCsv -Rows $allRows -Path $allCsv
 Export-AuditCsv -Rows $outboundRows -Path $outCsv
 Export-AuditCsv -Rows $inboundRows -Path $inCsv
-New-HtmlReport -Path $html -Org $org -AllRows $allRows -RunFolder $runFolder
+
+$reportMeta = @{
+    ScopeNote          = 'Scopes: Application.Read.All, Directory.Read.All, DelegatedPermissionGrant.Read.All, RoleManagement.Read.Directory, AuditLog.Read.All' + $(if ($IncludeExchange) { ' + Exchange Online RBAC' } else { '' })
+    SignInLookbackDays = $SignInLookbackDays
+}
+New-HtmlReport -Path $html -Org $org -AllRows $allRows -RunFolder $runFolder -Meta $reportMeta
 
 $summary = [PSCustomObject]@{
     TenantId                     = $resolvedTenantId
@@ -1504,7 +2119,11 @@ $summary = [PSCustomObject]@{
     InboundExternalSpCount       = (Get-ObjectCount $inboundRows)
     HighSeverityCount            = (Get-ObjectCount @($allRows | Where-Object { $_.Severity -eq 'High' }))
     MediumSeverityCount          = (Get-ObjectCount @($allRows | Where-Object { $_.Severity -eq 'Medium' }))
+    LowSeverityCount             = (Get-ObjectCount @($allRows | Where-Object { $_.Severity -eq 'Low' }))
     IncludeMicrosoftFirstParty   = [bool]$IncludeMicrosoftFirstParty
+    IncludeExchange              = [bool]$IncludeExchange
+    SignInActivityCollected      = [bool]$collectSignIns
+    SignInLookbackDays           = $SignInLookbackDays
     GeneratedUtc                 = [DateTime]::UtcNow.ToString('o')
 }
 $summary | ConvertTo-Json | Set-Content -Path (Join-Path $runFolder 'summary.json') -Encoding UTF8
