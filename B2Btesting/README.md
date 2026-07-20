@@ -188,7 +188,7 @@ The audit correlates several Entra/Graph surfaces per inbound service principal 
 | Owners / assigned users & groups | `owners`, `appRoleAssignedTo` |
 | Credentials | `keyCredentials` / `passwordCredentials` |
 | **Federated identity credentials** (outbound apps) | `applications/{id}/federatedIdentityCredentials` |
-| **Sign-in evidence** (actual use) | `auditLogs/signIns?$filter=appId eq …` (Entra ID P1) |
+| **Sign-in evidence** (actual use, all four categories: interactive user, non-interactive user, service principal, managed identity) | `auditLogs/signIns?$filter=appId eq … and signInEventTypes/any(t: t eq '<type>')` (Entra ID P1) |
 | **Exchange app RBAC + access policies** (`-IncludeExchange`) | `Get-ServicePrincipal`, `Get-ManagementRoleAssignment`, `Get-ApplicationAccessPolicy` |
 
 ### Security fields / risk flags

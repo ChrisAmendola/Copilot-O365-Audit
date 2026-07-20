@@ -123,6 +123,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Ensures the sign-in log failure warning is emitted at most once per run.
+$Script:SignInErrorReported = $false
+
+# Flat list of per-sign-in detail records (across all SPs) for the report's sign-in section.
+$Script:SignInDetailRecords = [System.Collections.Generic.List[object]]::new()
+
 # Well-known Microsoft "home" tenant IDs commonly seen as appOwnerOrganizationId for 1P apps.
 $Script:MicrosoftTenantIds = @(
     'f8cdef31-a31e-4b4a-93e4-5f571e91255a', # Microsoft Services
@@ -305,6 +311,18 @@ function Test-GraphContextMatchesTenant {
         return $true
     }
     return $false
+}
+
+function Test-GraphTokenValid {
+    # Cheap probe to confirm the current session token actually works (user-provided
+    # tokens expire after ~1h and are not refreshed, so a matching context can still be dead).
+    try {
+        $null = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id&$top=1' -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
 }
 
 function Test-IsCursorOrVsCodeTerminal {
@@ -518,8 +536,11 @@ function Connect-AuditGraph {
 
     if (-not $ForceReconnect -and -not $UseAppOnly -and (Test-GraphContextMatchesTenant -TargetTenant $TargetTenant)) {
         $existing = Get-MgContext
-        Write-AuditMsg ("Reusing existing Graph session (AuthType={0}; TenantId={1}). Use -ForceReconnect to sign in again." -f $existing.AuthType, $existing.TenantId) Ok
-        return [string]$existing.TenantId
+        if (Test-GraphTokenValid) {
+            Write-AuditMsg ("Reusing existing Graph session (AuthType={0}; TenantId={1}). Use -ForceReconnect to sign in again." -f $existing.AuthType, $existing.TenantId) Ok
+            return [string]$existing.TenantId
+        }
+        Write-AuditMsg 'Existing Graph session token is expired/invalid; signing in again...' Warn
     }
 
     if ($UseAppOnly) {
@@ -999,6 +1020,10 @@ function Collect-OutboundMultiTenantApps {
                 OwnedObjectCount                 = ''
                 ExchangeAppAccess                = ''
                 SignInCount                      = ''
+                InteractiveUserSignIns           = ''
+                NonInteractiveUserSignIns        = ''
+                ServicePrincipalSignIns          = ''
+                ManagedIdentitySignIns           = ''
                 LastSignIn                       = ''
                 SignInResources                  = ''
                 FederatedCredentials             = $ficSummary.Details
@@ -1429,44 +1454,149 @@ function Get-SpSignInSummary {
         [int]$LookbackDays = 30
     )
 
-    # Evidence of actual use: service-principal (app-only) sign-ins for this appId.
-    # Requires AuditLog.Read.All + Entra ID P1. Returns -1 count when unavailable.
-    if ([string]::IsNullOrWhiteSpace($AppId)) {
-        return [PSCustomObject]@{ SignInCount = -1; LastSignIn = ''; Details = '' }
+    # Evidence of actual use for this appId across ALL sign-in categories:
+    #   interactiveUser + nonInteractiveUser = users signing INTO the app (delegated)
+    #   servicePrincipal                     = the app authenticating as itself (app-only)
+    #   managedIdentity                      = managed-identity sign-ins
+    # The signIns endpoint returns only interactive user sign-ins unless you filter on
+    # signInEventTypes, so each category is queried explicitly.
+    # Requires AuditLog.Read.All + Entra ID P1. Counts are -1 when unavailable.
+    $unavailable = [PSCustomObject]@{
+        SignInCount             = -1
+        LastSignIn              = ''
+        Details                 = ''
+        InteractiveUserCount    = -1
+        NonInteractiveUserCount = -1
+        ServicePrincipalCount   = -1
+        ManagedIdentityCount    = -1
+        Records                 = @()
     }
-    $since = [DateTime]::UtcNow.AddDays(-[Math]::Abs($LookbackDays)).ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $filter = [uri]::EscapeDataString("appId eq '$AppId' and createdDateTime ge $since")
-    $uri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns?$filter={0}&$top=100' -f $filter
+    if ([string]::IsNullOrWhiteSpace($AppId)) { return $unavailable }
 
+    $since = [DateTime]::UtcNow.AddDays(-[Math]::Abs($LookbackDays)).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+    # Performance: the signIns reporting store is high-latency, so pull ALL four event types in a
+    # SINGLE query per SP (one lambda OR'ing every type) and bucket rows client-side, rather than
+    # firing one slow query per type. Rows are capped (top x MaxPages) to keep the summary fast.
+    $allTypes = "signInEventTypes/any(t: t eq 'interactiveUser' or t eq 'nonInteractiveUser' or t eq 'servicePrincipal' or t eq 'managedIdentity')"
+    # Match sign-ins where this app is the CLIENT (appId) OR the RESOURCE (resourceId). resourceId
+    # is the resource's appId, so non-interactive/token flows where the SP is the resource are caught.
+    $combined = [uri]::EscapeDataString("(appId eq '$AppId' or resourceId eq '$AppId') and createdDateTime ge $since and $allTypes")
+    $clientOnly = [uri]::EscapeDataString("appId eq '$AppId' and createdDateTime ge $since and $allTypes")
+
+    # NOTE: signInEventTypes is only a filterable property on the /beta endpoint. The /v1.0 signIns
+    # endpoint returns interactive sign-ins only and rejects signInEventTypes filters, so /beta is required.
+    $rows = $null
+    $firstError = $null
     try {
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri $uri -MaxPages 5)
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $combined) -MaxPages 3)
     }
     catch {
-        return [PSCustomObject]@{ SignInCount = -1; LastSignIn = ''; Details = '' }
+        $firstError = $_.Exception.Message
+        # Fall back to client-only filter if the combined (appId OR resourceId) filter is rejected.
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $clientOnly) -MaxPages 3)
+        }
+        catch {
+            if (-not $firstError) { $firstError = $_.Exception.Message }
+            if ($firstError -and -not $Script:SignInErrorReported) {
+                $Script:SignInErrorReported = $true
+                $hint = ''
+                if ($firstError -match '403|Forbidden|Authorization_RequestDenied|insufficient') {
+                    $hint = ' (missing AuditLog.Read.All consent or no Entra ID P1 license; re-run with -ForceReconnect to grant the scope)'
+                }
+                elseif ($firstError -match '401|expired|InvalidAuthenticationToken') {
+                    $hint = ' (token expired; re-run with -ForceReconnect)'
+                }
+                Write-AuditMsg ("  WARNING: sign-in log queries failed - reporting n/a. First error: {0}{1}" -f $firstError, $hint) Warn
+            }
+            return $unavailable
+        }
     }
 
-    $count = 0
-    $last = $null
+    $overallLast = $null
     $resources = [System.Collections.Generic.List[string]]::new()
+    $records = [System.Collections.Generic.List[object]]::new()
+    $ic = 0; $ni = 0; $sp = 0; $mi = 0
+    $total = 0
     foreach ($s in $rows) {
         if (-not (Test-IsGraphRowObject $s)) { continue }
-        $count++
+        $total++
         $created = [string](Get-GraphProp -Object $s -Name 'createdDateTime')
+        $createdUtc = ''
         if ($created) {
             try {
                 $dt = [DateTime]::Parse($created).ToUniversalTime()
-                if (-not $last -or $dt -gt $last) { $last = $dt }
+                $createdUtc = $dt.ToString('u')
+                if (-not $overallLast -or $dt -gt $overallLast) { $overallLast = $dt }
             }
-            catch { }
+            catch { $createdUtc = $created }
         }
         $resName = [string](Get-GraphProp -Object $s -Name 'resourceDisplayName')
         if ($resName -and -not ($resources -contains $resName)) { [void]$resources.Add($resName) }
+
+        $typeList = [System.Collections.Generic.List[string]]::new()
+        $types = Get-GraphProp -Object $s -Name 'signInEventTypes'
+        foreach ($t in (ConvertTo-ObjectArray $types)) {
+            [void]$typeList.Add([string]$t)
+            switch ([string]$t) {
+                'interactiveUser' { $ic++ }
+                'nonInteractiveUser' { $ni++ }
+                'servicePrincipal' { $sp++ }
+                'managedIdentity' { $mi++ }
+            }
+        }
+
+        # Identity: user principal name for user sign-ins, else the calling app/SP name.
+        $identity = [string](Get-GraphProp -Object $s -Name 'userPrincipalName')
+        if ([string]::IsNullOrWhiteSpace($identity)) { $identity = [string](Get-GraphProp -Object $s -Name 'userDisplayName') }
+        if ([string]::IsNullOrWhiteSpace($identity)) { $identity = [string](Get-GraphProp -Object $s -Name 'appDisplayName') }
+        if ([string]::IsNullOrWhiteSpace($identity)) { $identity = [string](Get-GraphProp -Object $s -Name 'servicePrincipalName') }
+
+        # Status: errorCode 0 = success; otherwise surface the failure reason/code.
+        $statusText = 'Success'
+        $statusOk = $true
+        $status = Get-GraphProp -Object $s -Name 'status'
+        if ($status) {
+            $errCode = [string](Get-GraphProp -Object $status -Name 'errorCode')
+            $failReason = [string](Get-GraphProp -Object $status -Name 'failureReason')
+            if ($errCode -and $errCode -ne '0') {
+                $statusOk = $false
+                $statusText = if ($failReason -and $failReason -ne 'Other.') { "Failure ($errCode): $failReason" } else { "Failure ($errCode)" }
+            }
+        }
+
+        # Location: "City, Country".
+        $locText = ''
+        $loc = Get-GraphProp -Object $s -Name 'location'
+        if ($loc) {
+            $city = [string](Get-GraphProp -Object $loc -Name 'city')
+            $country = [string](Get-GraphProp -Object $loc -Name 'countryOrRegion')
+            $locText = (@($city, $country) | Where-Object { $_ }) -join ', '
+        }
+
+        [void]$records.Add([PSCustomObject][ordered]@{
+                Time      = $createdUtc
+                Identity  = $identity
+                EventType = ($typeList -join ', ')
+                IpAddress = [string](Get-GraphProp -Object $s -Name 'ipAddress')
+                Location  = $locText
+                Status    = $statusText
+                StatusOk  = $statusOk
+                Resource  = $resName
+                ClientApp = [string](Get-GraphProp -Object $s -Name 'clientAppUsed')
+            })
     }
 
     return [PSCustomObject]@{
-        SignInCount = $count
-        LastSignIn  = $(if ($last) { $last.ToString('u') } else { '' })
-        Details     = ($resources -join '; ')
+        SignInCount             = $total
+        LastSignIn              = $(if ($overallLast) { $overallLast.ToString('u') } else { '' })
+        Details                 = ($resources -join '; ')
+        InteractiveUserCount    = $ic
+        NonInteractiveUserCount = $ni
+        ServicePrincipalCount   = $sp
+        ManagedIdentityCount    = $mi
+        Records                 = $records.ToArray()
     }
 }
 
@@ -1522,11 +1652,35 @@ function Collect-InboundExternalServicePrincipals {
         $groupSummary = Get-SpGroupMembershipSummary -ServicePrincipalId $spId
         $ownedSummary = Get-SpOwnedObjectsSummary -ServicePrincipalId $spId
         $signInSummary = if ($CollectSignIns) {
-            Write-AuditMsg ("      querying sign-in logs ({0}d)..." -f $SignInLookbackDays)
+            Write-AuditMsg ("      querying sign-in logs ({0}d; interactive/non-interactive/SP/MI)..." -f $SignInLookbackDays)
             Get-SpSignInSummary -AppId $appId -LookbackDays $SignInLookbackDays
         }
         else {
-            [PSCustomObject]@{ SignInCount = -1; LastSignIn = ''; Details = '' }
+            [PSCustomObject]@{
+                SignInCount = -1; LastSignIn = ''; Details = ''
+                InteractiveUserCount = -1; NonInteractiveUserCount = -1
+                ServicePrincipalCount = -1; ManagedIdentityCount = -1
+                Records = @()
+            }
+        }
+        # Accumulate per-sign-in detail records (tagged with this SP) for the report's sign-in section.
+        if ($signInSummary.PSObject.Properties['Records']) {
+            foreach ($rec in (ConvertTo-ObjectArray $signInSummary.Records)) {
+                if (-not (Test-IsGraphRowObject $rec)) { continue }
+                [void]$Script:SignInDetailRecords.Add([PSCustomObject][ordered]@{
+                        ServicePrincipal = $name
+                        AppId            = $appId
+                        Time             = [string](Get-GraphProp -Object $rec -Name 'Time')
+                        Identity         = [string](Get-GraphProp -Object $rec -Name 'Identity')
+                        EventType        = [string](Get-GraphProp -Object $rec -Name 'EventType')
+                        IpAddress        = [string](Get-GraphProp -Object $rec -Name 'IpAddress')
+                        Location         = [string](Get-GraphProp -Object $rec -Name 'Location')
+                        Status           = [string](Get-GraphProp -Object $rec -Name 'Status')
+                        StatusOk         = [bool](Get-GraphProp -Object $rec -Name 'StatusOk')
+                        Resource         = [string](Get-GraphProp -Object $rec -Name 'Resource')
+                        ClientApp        = [string](Get-GraphProp -Object $rec -Name 'ClientApp')
+                    })
+            }
         }
         $exchangeAccess = ''
         if ($ExchangeMap -and $appId -and $ExchangeMap.ContainsKey($appId.ToLowerInvariant())) {
@@ -1642,6 +1796,10 @@ function Collect-InboundExternalServicePrincipals {
                 OwnedObjectCount               = $(if ($ownedSummary.OwnedCount -ge 0) { $ownedSummary.OwnedCount } else { '' })
                 ExchangeAppAccess              = $exchangeAccess
                 SignInCount                    = $(if ($signInSummary.SignInCount -ge 0) { $signInSummary.SignInCount } else { '' })
+                InteractiveUserSignIns         = $(if ($signInSummary.InteractiveUserCount -ge 0) { $signInSummary.InteractiveUserCount } else { '' })
+                NonInteractiveUserSignIns      = $(if ($signInSummary.NonInteractiveUserCount -ge 0) { $signInSummary.NonInteractiveUserCount } else { '' })
+                ServicePrincipalSignIns        = $(if ($signInSummary.ServicePrincipalCount -ge 0) { $signInSummary.ServicePrincipalCount } else { '' })
+                ManagedIdentitySignIns         = $(if ($signInSummary.ManagedIdentityCount -ge 0) { $signInSummary.ManagedIdentityCount } else { '' })
                 LastSignIn                     = $signInSummary.LastSignIn
                 SignInResources                = $signInSummary.Details
                 FederatedCredentials           = ''
@@ -1835,7 +1993,8 @@ function New-HtmlReport {
         [Parameter(Mandatory)]$Org,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AllRows,
         [Parameter(Mandatory)][string]$RunFolder,
-        [hashtable]$Meta
+        [hashtable]$Meta,
+        [AllowEmptyCollection()][object[]]$SignInRecords = @()
     )
 
     $outbound = @($AllRows | Where-Object { $_.Direction -eq 'Outbound' })
@@ -1850,12 +2009,13 @@ function New-HtmlReport {
     }
 
     # Render a possibly-long, delimited value as a collapsible list; '—' when empty.
+    # Within an item, ' | ' field separators are rendered as line breaks for readability.
     function Format-CollapsibleCell {
         param([string]$Value, [string]$Delimiter = ';')
         if ([string]::IsNullOrWhiteSpace($Value)) { return '<span class="muted">&mdash;</span>' }
         $parts = @($Value -split [regex]::Escape($Delimiter) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($parts.Count -le 1) { return ('<span>{0}</span>' -f (Esc ($parts -join ''))) }
-        $items = ($parts | ForEach-Object { '<li>{0}</li>' -f (Esc $_) }) -join ''
+        if ($parts.Count -le 1) { return ('<span>{0}</span>' -f ((Esc ($parts -join '')) -replace ' \| ', '<br/>')) }
+        $items = ($parts | ForEach-Object { '<li>{0}</li>' -f ((Esc $_) -replace ' \| ', '<br/>') }) -join ''
         return ('<details><summary>{0} items</summary><ul class="cell-list">{1}</ul></details>' -f $parts.Count, $items)
     }
 
@@ -1924,8 +2084,10 @@ footer{color:var(--muted);font-size:12px;margin:24px 0 8px;text-align:center}
 <script>
 function auditFilter(sectionId){
   var sec=document.getElementById(sectionId);
-  var q=(sec.querySelector('.f-search').value||'').toLowerCase();
-  var sev=sec.querySelector('.f-sev').value;
+  var searchEl=sec.querySelector('.f-search');
+  var q=((searchEl&&searchEl.value)||'').toLowerCase();
+  var sevEl=sec.querySelector('.f-sev');
+  var sev=sevEl?sevEl.value:'';
   var rows=sec.querySelectorAll('tbody tr');
   var shown=0;
   rows.forEach(function(r){
@@ -1971,6 +2133,7 @@ function auditSort(th){
     [void]$sb.AppendLine(('<div class="card low"><div class="n">{0}</div><div class="l">Low severity</div></div>' -f (Get-ObjectCount $low)))
     [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Inbound enterprise apps</div></div>' -f (Get-ObjectCount $inbound)))
     [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Outbound app registrations</div></div>' -f (Get-ObjectCount $outbound)))
+    [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Sign-in events captured</div></div>' -f (Get-ObjectCount $SignInRecords)))
     [void]$sb.AppendLine('</div>')
 
     [void]$sb.AppendLine('<div class="legend"><span><span class="badge sev-high">High</span> privileged app perms / directory roles</span><span><span class="badge sev-med">Medium</span> consented perms / owned objects</span><span><span class="badge sev-low">Low</span> presence only</span></div>')
@@ -1986,14 +2149,25 @@ function auditSort(th){
     [void]$sb.AppendLine('<select class="f-sev" onchange="auditFilter(''sec-inbound'')"><option value="">All severities</option><option>High</option><option>Medium</option><option>Low</option></select>')
     [void]$sb.AppendLine('<span class="f-count muted"></span>')
     [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
-    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Severity</th><th onclick="auditSort(this)">DisplayName</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Home tenant</th><th onclick="auditSort(this)">Risk flags</th><th onclick="auditSort(this)">Admin-consent permissions</th><th onclick="auditSort(this)">User-consent permissions</th><th onclick="auditSort(this)">Directory roles</th><th onclick="auditSort(this)">Eligible (PIM) roles</th><th onclick="auditSort(this)">Group memberships</th><th onclick="auditSort(this)">Owned objects</th><th onclick="auditSort(this)">Owners / admins</th><th onclick="auditSort(this)">Assigned users/groups</th><th onclick="auditSort(this)">Exchange access</th><th onclick="auditSort(this)">Sign-ins</th><th onclick="auditSort(this)">Notes</th></tr></thead><tbody>')
+    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Severity</th><th onclick="auditSort(this)">DisplayName</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Home tenant</th><th onclick="auditSort(this)">Risk flags</th><th onclick="auditSort(this)">Admin-consent permissions</th><th onclick="auditSort(this)">User-consent permissions</th><th onclick="auditSort(this)">Directory roles</th><th onclick="auditSort(this)">Eligible (PIM) roles</th><th onclick="auditSort(this)">Group memberships</th><th onclick="auditSort(this)">Owned objects</th><th onclick="auditSort(this)">Owners / admins</th><th onclick="auditSort(this)">Assigned users/groups</th><th onclick="auditSort(this)">Exchange access</th><th onclick="auditSort(this)">Sign-ins (total; int/non-int/SP/MI)</th><th onclick="auditSort(this)">Notes</th></tr></thead><tbody>')
     if ($inboundSorted.Count -eq 0) {
         [void]$sb.AppendLine('<tr><td colspan="16" class="muted">No inbound external service principals in this run.</td></tr>')
     }
     else {
         foreach ($r in $inboundSorted) {
             $rowcls = switch ($r.Severity) { 'High' { 'row-high' } 'Medium' { 'row-med' } default { 'row-low' } }
-            $signInText = if ([string]::IsNullOrWhiteSpace([string]$r.SignInCount)) { '<span class="muted">n/a</span>' } elseif ([int]$r.SignInCount -eq 0) { '<span class="pill pill-hot">0</span>' } else { ('{0}<br/><span class="muted">{1}</span>' -f (Esc $r.SignInCount), (Esc $r.LastSignIn)) }
+            $fmtT = { param($v) if ([string]::IsNullOrWhiteSpace([string]$v)) { '-' } else { [string]$v } }
+            $breakdown = ('<span class="muted" style="font-size:11px">int {0} &middot; non-int {1} &middot; SP {2} &middot; MI {3}</span>' -f `
+                (Esc (& $fmtT $r.InteractiveUserSignIns)), (Esc (& $fmtT $r.NonInteractiveUserSignIns)), (Esc (& $fmtT $r.ServicePrincipalSignIns)), (Esc (& $fmtT $r.ManagedIdentitySignIns)))
+            $signInText = if ([string]::IsNullOrWhiteSpace([string]$r.SignInCount)) {
+                '<span class="muted">n/a</span>'
+            }
+            elseif ([int]$r.SignInCount -eq 0) {
+                '<span class="pill pill-hot">0</span><br/>' + $breakdown
+            }
+            else {
+                ('<strong>{0}</strong><br/>{1}<br/><span class="muted">{2}</span>' -f (Esc $r.SignInCount), $breakdown, (Esc $r.LastSignIn))
+            }
             [void]$sb.AppendLine(('<tr class="{0}" data-sev="{1}"><td>{2}</td><td>{3}</td><td><code>{4}</code></td><td><code>{5}</code></td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td><td>{11}</td><td>{12}</td><td>{13}</td><td>{14}</td><td>{15}</td><td>{16}</td><td class="notes">{17}</td></tr>' -f `
                     $rowcls,
                     (Esc $r.Severity),
@@ -2017,6 +2191,45 @@ function auditSort(th){
     }
     [void]$sb.AppendLine('</tbody></table></div>')
     [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Admin consent = application permissions (appRoleAssignments) + delegated grants with consentType=AllPrincipals. User consent = delegated grants with consentType=Principal (per user). Sign-ins = app-only sign-ins in the lookback window (requires Entra ID P1).</p>')
+    [void]$sb.AppendLine('</section>')
+
+    # ---- Sign-in activity detail section ----
+    $signInSorted = @($SignInRecords | Sort-Object @{ Expression = { $_.Time }; Descending = $true })
+    [void]$sb.AppendLine('<section id="sec-signins">')
+    [void]$sb.AppendLine('<h2>Sign-in activity detail &mdash; per-event log</h2>')
+    [void]$sb.AppendLine('<div class="controls">')
+    [void]$sb.AppendLine('<input type="search" class="f-search" placeholder="Search by app, user, IP, status, resource..." oninput="auditFilter(''sec-signins'')"/>')
+    [void]$sb.AppendLine('<span class="f-count muted"></span>')
+    [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
+    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Time (UTC)</th><th onclick="auditSort(this)">Service principal</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Identity</th><th onclick="auditSort(this)">Event type</th><th onclick="auditSort(this)">IP address</th><th onclick="auditSort(this)">Location</th><th onclick="auditSort(this)">Status</th><th onclick="auditSort(this)">Resource</th><th onclick="auditSort(this)">Client app</th></tr></thead><tbody>')
+    if ($signInSorted.Count -eq 0) {
+        [void]$sb.AppendLine('<tr><td colspan="10" class="muted">No sign-in events captured (sign-in collection skipped, unavailable, or no activity in the lookback window).</td></tr>')
+    }
+    else {
+        foreach ($r in $signInSorted) {
+            $okBool = $false
+            try { $okBool = [bool]$r.StatusOk } catch { $okBool = $false }
+            $statusHtml = if ($okBool) {
+                ('<span class="pill" style="background:#e6f4ea;color:#1e7e34;border-color:#bfe3c9">{0}</span>' -f (Esc $r.Status))
+            }
+            else {
+                ('<span class="pill pill-hot">{0}</span>' -f (Esc $r.Status))
+            }
+            [void]$sb.AppendLine(('<tr><td>{0}</td><td>{1}</td><td><code>{2}</code></td><td>{3}</td><td>{4}</td><td><code>{5}</code></td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td></tr>' -f `
+                    (Esc $r.Time),
+                    (Esc $r.ServicePrincipal),
+                    (Esc $r.AppId),
+                    (Esc $r.Identity),
+                    (Esc $r.EventType),
+                    (Esc $r.IpAddress),
+                    (Esc $r.Location),
+                    $statusHtml,
+                    (Esc $r.Resource),
+                    (Esc $r.ClientApp)))
+        }
+    }
+    [void]$sb.AppendLine('</tbody></table></div>')
+    [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Per-event sign-in logs for the inbound service principals above (capped per app for performance). Includes interactive, non-interactive, service-principal, and managed-identity sign-ins. Full data is in multitenant-apps-signins.csv.</p>')
     [void]$sb.AppendLine('</section>')
 
     # ---- Outbound section ----
@@ -2100,17 +2313,21 @@ $null = New-Item -ItemType Directory -Path $runFolder -Force
 $allCsv = Join-Path $runFolder 'multitenant-apps-all.csv'
 $outCsv = Join-Path $runFolder 'multitenant-apps-outbound.csv'
 $inCsv = Join-Path $runFolder 'multitenant-apps-inbound.csv'
+$signInsCsv = Join-Path $runFolder 'multitenant-apps-signins.csv'
 $html = Join-Path $runFolder 'multitenant-apps-report.html'
+
+$signInRecords = ConvertTo-ObjectArray $Script:SignInDetailRecords
 
 Export-AuditCsv -Rows $allRows -Path $allCsv
 Export-AuditCsv -Rows $outboundRows -Path $outCsv
 Export-AuditCsv -Rows $inboundRows -Path $inCsv
+Export-AuditCsv -Rows $signInRecords -Path $signInsCsv
 
 $reportMeta = @{
     ScopeNote          = 'Scopes: Application.Read.All, Directory.Read.All, DelegatedPermissionGrant.Read.All, RoleManagement.Read.Directory, AuditLog.Read.All' + $(if ($IncludeExchange) { ' + Exchange Online RBAC' } else { '' })
     SignInLookbackDays = $SignInLookbackDays
 }
-New-HtmlReport -Path $html -Org $org -AllRows $allRows -RunFolder $runFolder -Meta $reportMeta
+New-HtmlReport -Path $html -Org $org -AllRows $allRows -RunFolder $runFolder -Meta $reportMeta -SignInRecords $signInRecords
 
 $summary = [PSCustomObject]@{
     TenantId                     = $resolvedTenantId
@@ -2133,6 +2350,7 @@ Write-AuditMsg 'Exported:' Ok
 Write-Host "  $allCsv"
 Write-Host "  $outCsv"
 Write-Host "  $inCsv"
+Write-Host "  $signInsCsv"
 Write-Host "  $html"
 Write-Host ("  summary: outbound={0}; inbound={1}; high={2}; medium={3}" -f `
         $summary.OutboundMultiTenantAppCount, $summary.InboundExternalSpCount, $summary.HighSeverityCount, $summary.MediumSeverityCount)

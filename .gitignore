@@ -172,3 +172,4 @@ CopilotExposureOutput/run-20260716-210834/resources-by-blast-radius.csv
 CopilotExposureOutput/run-20260716-210834/user-reach-by-principal.csv
 CopilotExposureOutput/run-20260716-210834/users-by-blast-radius.csv
 docs/superpowers/specs/2026-07-16-graph-app-only-auth-design.md
+.gitignore
