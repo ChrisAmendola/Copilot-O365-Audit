@@ -113,6 +113,9 @@ param(
     # Skip sign-in log evidence collection (auditLogs/signIns needs Entra ID P1).
     [switch]$SkipSignInActivity,
 
+    # Skip the source-IP intelligence pass (RDAP + reverse DNS) over sign-in IPs.
+    [switch]$SkipIpIntelligence,
+
     # How many days of sign-in activity to summarize per service principal.
     [int]$SignInLookbackDays = 30,
 
@@ -128,6 +131,17 @@ $Script:SignInErrorReported = $false
 
 # Flat list of per-sign-in detail records (across all SPs) for the report's sign-in section.
 $Script:SignInDetailRecords = [System.Collections.Generic.List[object]]::new()
+
+# Cache of applicationTemplateId -> gallery template display name (avoids repeat Graph calls).
+$Script:AppTemplateNameCache = @{}
+
+# Subnet-keyed RDAP cache: each entry has Start/End (BigInteger) covering the network
+# allocation returned by RDAP, plus the parsed result. Any IP that falls inside an already
+# resolved range reuses that result without another RDAP call.
+$Script:RdapSubnetCache = [System.Collections.Generic.List[object]]::new()
+
+# Well-known "non-gallery application" template id (used by "create your own application").
+$Script:NonGalleryTemplateId = '8adf8e6e-67b2-4cf2-a259-e3dc5476c621'
 
 # Well-known Microsoft "home" tenant IDs commonly seen as appOwnerOrganizationId for 1P apps.
 $Script:MicrosoftTenantIds = @(
@@ -1600,6 +1614,260 @@ function Get-SpSignInSummary {
     }
 }
 
+#region IP intelligence (RDAP + reverse DNS)
+function Test-IsPrivateOrReservedIp {
+    param([string]$Ip)
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return $true }
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$parsed)) { return $true }
+
+    if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        $s = $Ip.ToLowerInvariant()
+        # loopback ::1, link-local fe80::/10, unique-local fc00::/7
+        if ($s -eq '::1' -or $s.StartsWith('fe8') -or $s.StartsWith('fe9') -or $s.StartsWith('fea') -or $s.StartsWith('feb') -or $s.StartsWith('fc') -or $s.StartsWith('fd')) { return $true }
+        return $false
+    }
+
+    $b = $parsed.GetAddressBytes()
+    switch ($b[0]) {
+        10 { return $true }                                   # 10.0.0.0/8
+        127 { return $true }                                  # loopback
+        169 { if ($b[1] -eq 254) { return $true } }           # link-local 169.254/16
+        172 { if ($b[1] -ge 16 -and $b[1] -le 31) { return $true } } # 172.16/12
+        192 { if ($b[1] -eq 168) { return $true } }           # 192.168/16
+        0 { return $true }
+        255 { return $true }
+    }
+    return $false
+}
+
+function Get-RdapVcardFn {
+    # Return the 'fn' (formatted name / org) value from a single RDAP entity's vcardArray.
+    param($Entity)
+    if ($null -eq $Entity) { return '' }
+    if (-not $Entity.PSObject.Properties['vcardArray']) { return '' }
+    $va = @($Entity.vcardArray)
+    if ($va.Count -lt 2) { return '' }
+    foreach ($item in @($va[1])) {
+        $parts = @($item)
+        if ($parts.Count -ge 4 -and [string]$parts[0] -eq 'fn') { return [string]$parts[3] }
+    }
+    return ''
+}
+
+function Test-RdapEntityHasRole {
+    param($Entity, [string]$Role)
+    if ($null -eq $Entity -or -not $Entity.PSObject.Properties['roles']) { return $false }
+    foreach ($r in @($Entity.roles)) { if ([string]$r -eq $Role) { return $true } }
+    return $false
+}
+
+function Get-RdapRegistrant {
+    # Prefer the org name of entities with the 'registrant' role; fall back to top-level entity names.
+    # Avoids recursing into nested contact entities (abuse/admin/technical) which add noise.
+    param($Resp)
+    $preferred = [System.Collections.Generic.List[string]]::new()
+    $fallback = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Resp -or -not $Resp.PSObject.Properties['entities']) { return '' }
+    foreach ($e in @($Resp.entities)) {
+        $fn = Get-RdapVcardFn $e
+        if (-not $fn) { continue }
+        if (Test-RdapEntityHasRole -Entity $e -Role 'registrant') { [void]$preferred.Add($fn) }
+        else { [void]$fallback.Add($fn) }
+    }
+    $chosen = if ($preferred.Count -gt 0) { $preferred } else { $fallback }
+    return ((@($chosen) | Select-Object -Unique) -join '; ')
+}
+
+function ConvertTo-IpNumber {
+    # Convert an IPv4/IPv6 string to a comparable non-negative BigInteger (network byte order).
+    param([string]$Ip)
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$addr)) { return $null }
+    $bytes = $addr.GetAddressBytes()
+    [array]::Reverse($bytes)            # BigInteger wants little-endian
+    $bytes = $bytes + [byte]0           # append 0x00 so the value stays positive
+    return [System.Numerics.BigInteger]::new($bytes)
+}
+
+function Get-RdapRegistryFromLinks {
+    # Identify the responsible RIR from the RDAP 'links' (mirrors the Network Diagnostic Tool).
+    param($Resp)
+    if ($null -eq $Resp -or -not $Resp.PSObject.Properties['links']) { return '' }
+    $map = @{ 'arin.net' = 'ARIN'; 'ripe.net' = 'RIPE'; 'apnic.net' = 'APNIC'; 'lacnic.net' = 'LACNIC'; 'afrinic.net' = 'AFRINIC' }
+    foreach ($link in @($Resp.links)) {
+        $href = if ($link.PSObject.Properties['href']) { [string]$link.href } else { '' }
+        foreach ($k in $map.Keys) { if ($href -match [regex]::Escape($k)) { return $map[$k] } }
+    }
+    return ''
+}
+
+function Get-IpAddressIntelligence {
+    <#
+        Enriches a single IP with a reverse-DNS (PTR) lookup and RDAP registration data
+        (registrant/org, network name, CIDR, country). The RDAP response describes the whole
+        network allocation, so the parsed result is cached by that subnet range: subsequent IPs
+        inside an already-resolved block reuse it with no extra RDAP call. Reverse DNS is always
+        per-IP. Private/reserved IPs are flagged and never sent to RDAP.
+    #>
+    param([Parameter(Mandatory)][string]$Ip)
+
+    $result = [PSCustomObject][ordered]@{
+        IpAddress   = $Ip
+        ReverseDns  = ''
+        Registrant  = ''
+        NetworkName = ''
+        Cidr        = ''
+        Country     = ''
+        Source      = ''
+    }
+
+    try { $result.ReverseDns = [System.Net.Dns]::GetHostEntry($Ip).HostName } catch { $result.ReverseDns = '' }
+
+    if (Test-IsPrivateOrReservedIp -Ip $Ip) {
+        $result.Registrant = 'Private / reserved (non-routable)'
+        $result.Source = 'n/a'
+        return $result
+    }
+
+    # Subnet cache hit: reuse the network's RDAP data (only reverse DNS differs per IP).
+    $ipNum = ConvertTo-IpNumber -Ip $Ip
+    if ($null -ne $ipNum) {
+        foreach ($entry in $Script:RdapSubnetCache) {
+            if ($ipNum -ge $entry.Start -and $ipNum -le $entry.End) {
+                $result.Registrant = $entry.Registrant
+                $result.NetworkName = $entry.NetworkName
+                $result.Cidr = $entry.Cidr
+                $result.Country = $entry.Country
+                $result.Source = ('{0} (cached subnet {1})' -f $entry.Source, $entry.Cidr)
+                return $result
+            }
+        }
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Uri ('https://rdap.org/ip/{0}' -f $Ip) -Headers @{ Accept = 'application/rdap+json, application/json' } -TimeoutSec 20 -ErrorAction Stop
+        if ($resp.PSObject.Properties['name']) { $result.NetworkName = [string]$resp.name }
+        if ($resp.PSObject.Properties['country']) { $result.Country = [string]$resp.country }
+
+        if ($resp.PSObject.Properties['cidr0_cidrs'] -and $resp.cidr0_cidrs) {
+            $cidrs = foreach ($c in @($resp.cidr0_cidrs)) {
+                $prefix = if ($c.PSObject.Properties['v4prefix']) { [string]$c.v4prefix } elseif ($c.PSObject.Properties['v6prefix']) { [string]$c.v6prefix } else { '' }
+                $len = if ($c.PSObject.Properties['length']) { [string]$c.length } else { '' }
+                if ($prefix) { "$prefix/$len" }
+            }
+            $result.Cidr = (@($cidrs) -join ', ')
+        }
+        if (-not $result.Cidr -and $resp.PSObject.Properties['startAddress'] -and $resp.startAddress) {
+            $end = if ($resp.PSObject.Properties['endAddress']) { [string]$resp.endAddress } else { '' }
+            $result.Cidr = ("{0} - {1}" -f [string]$resp.startAddress, $end)
+        }
+
+        $result.Registrant = Get-RdapRegistrant -Resp $resp
+        if (-not $result.Registrant -and $result.NetworkName) { $result.Registrant = $result.NetworkName }
+        $rir = Get-RdapRegistryFromLinks -Resp $resp
+        $result.Source = if ($rir) { "RDAP ($rir)" } else { 'RDAP' }
+
+        # Cache by the network allocation range so other IPs in this subnet skip the RDAP call.
+        $startStr = if ($resp.PSObject.Properties['startAddress']) { [string]$resp.startAddress } else { '' }
+        $endStr = if ($resp.PSObject.Properties['endAddress']) { [string]$resp.endAddress } else { '' }
+        $startNum = if ($startStr) { ConvertTo-IpNumber -Ip $startStr } else { $null }
+        $endNum = if ($endStr) { ConvertTo-IpNumber -Ip $endStr } else { $null }
+        if ($null -ne $startNum -and $null -ne $endNum -and $endNum -ge $startNum) {
+            [void]$Script:RdapSubnetCache.Add([PSCustomObject]@{
+                    Start       = $startNum
+                    End         = $endNum
+                    Registrant  = $result.Registrant
+                    NetworkName = $result.NetworkName
+                    Cidr        = $result.Cidr
+                    Country     = $result.Country
+                    Source      = $result.Source
+                })
+        }
+    }
+    catch {
+        $result.Source = ("RDAP lookup failed: {0}" -f $_.Exception.Message)
+    }
+
+    return $result
+}
+
+function Get-SignInIpIntelligence {
+    <#
+        Builds per-IP intelligence for every unique source IP seen across the sign-in records:
+        event count, which applications used it, reverse DNS, and RDAP registrant/network/country.
+    #>
+    param([AllowEmptyCollection()][object[]]$SignInRecords)
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    $ipGroups = @($SignInRecords | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.IpAddress) } | Group-Object -Property IpAddress)
+    if ($ipGroups.Count -eq 0) { return , $records.ToArray() }
+
+    Write-AuditMsg ("Enriching {0} unique sign-in IP(s) via RDAP + reverse DNS (subnet-cached)..." -f $ipGroups.Count)
+    $n = 0
+    foreach ($g in $ipGroups) {
+        $n++
+        $ip = [string]$g.Name
+        $apps = @($g.Group | ForEach-Object { [string]$_.ServicePrincipal } | Where-Object { $_ } | Select-Object -Unique)
+        $lastSeen = ''
+        $times = @($g.Group | ForEach-Object { [string]$_.Time } | Where-Object { $_ } | Sort-Object -Descending)
+        if ($times.Count -gt 0) { $lastSeen = $times[0] }
+
+        $intel = Get-IpAddressIntelligence -Ip $ip
+        $cacheTag = if ([string]$intel.Source -match 'cached') { ' (cached)' } else { '' }
+        Write-AuditMsg ("  [{0}/{1}] {2}{3}" -f $n, $ipGroups.Count, $ip, $cacheTag)
+        [void]$records.Add([PSCustomObject][ordered]@{
+                IpAddress    = $ip
+                Events       = $g.Count
+                Applications = (@($apps) -join '; ')
+                ReverseDns   = $intel.ReverseDns
+                Registrant   = $intel.Registrant
+                NetworkName  = $intel.NetworkName
+                Cidr         = $intel.Cidr
+                Country      = $intel.Country
+                LastSeen     = $lastSeen
+                Source       = $intel.Source
+            })
+    }
+    return , $records.ToArray()
+}
+#endregion
+
+#region Entra App Gallery
+function Get-AppTemplateName {
+    # Resolve an application template's display name from the Entra App Gallery catalog (cached).
+    param([Parameter(Mandatory)][string]$TemplateId)
+    if ($Script:AppTemplateNameCache.ContainsKey($TemplateId)) { return $Script:AppTemplateNameCache[$TemplateId] }
+    $name = ''
+    try {
+        $uri = 'https://graph.microsoft.com/v1.0/applicationTemplates/{0}?$select=id,displayName,publisher' -f $TemplateId
+        $t = Invoke-GraphRequestWithRetry -Uri $uri
+        $name = [string](Get-GraphProp -Object $t -Name 'displayName')
+    }
+    catch { $name = '' }
+    $Script:AppTemplateNameCache[$TemplateId] = $name
+    return $name
+}
+
+function Get-AppGalleryStatus {
+    <#
+        Determines whether an enterprise application is listed in the Microsoft Entra App Gallery.
+        Gallery apps are instantiated from an application template, so servicePrincipal.applicationTemplateId
+        is populated with a real template id. The special id 8adf8e6e-... means "non-gallery / custom".
+    #>
+    param([string]$TemplateId)
+
+    if ([string]::IsNullOrWhiteSpace($TemplateId)) {
+        return [PSCustomObject]@{ InGallery = $false; Status = 'Custom (no template)'; TemplateId = ''; TemplateName = '' }
+    }
+    if ($TemplateId -eq $Script:NonGalleryTemplateId) {
+        return [PSCustomObject]@{ InGallery = $false; Status = 'Non-gallery (custom)'; TemplateId = $TemplateId; TemplateName = 'Non-gallery application' }
+    }
+    $name = Get-AppTemplateName -TemplateId $TemplateId
+    return [PSCustomObject]@{ InGallery = $true; Status = 'Gallery'; TemplateId = $TemplateId; TemplateName = $name }
+}
+#endregion
+
 function Collect-InboundExternalServicePrincipals {
     param(
         [Parameter(Mandatory)][string]$TenantOrgId,
@@ -1611,7 +1879,7 @@ function Collect-InboundExternalServicePrincipals {
     )
 
     Write-AuditMsg 'Collecting inbound enterprise apps (service principals from other tenants)...'
-    $select = 'id,appId,displayName,appOwnerOrganizationId,accountEnabled,createdDateTime,servicePrincipalType,preferredSingleSignOnMode,homepage,replyUrls,keyCredentials,passwordCredentials,verifiedPublisher,publisherName,tags,notes,info'
+    $select = 'id,appId,displayName,appOwnerOrganizationId,accountEnabled,createdDateTime,servicePrincipalType,preferredSingleSignOnMode,homepage,replyUrls,keyCredentials,passwordCredentials,verifiedPublisher,publisherName,tags,notes,info,applicationTemplateId'
     $sps = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/servicePrincipals?$select={0}' -f $select))
     Write-AuditMsg ("  Fetched {0} service principals; scanning for external ones..." -f (Get-ObjectCount $sps))
     if ((Get-ObjectCount $sps) -le 1) {
@@ -1687,6 +1955,9 @@ function Collect-InboundExternalServicePrincipals {
             $exchangeAccess = [string]$ExchangeMap[$appId.ToLowerInvariant()]
         }
 
+        $templateId = [string](Get-GraphProp -Object $sp -Name 'applicationTemplateId')
+        $gallery = Get-AppGalleryStatus -TemplateId $templateId
+
         $replyUrls = @((Get-GraphProp -Object $sp -Name 'replyUrls') | Where-Object { $_ })
         $redirectFlags = [System.Collections.Generic.List[string]]::new()
         foreach ($u in $replyUrls) {
@@ -1719,6 +1990,7 @@ function Collect-InboundExternalServicePrincipals {
         if ($enabled -eq $false) { [void]$risk.Add('DisabledButPresent') }
         if ([string]::IsNullOrWhiteSpace($verifiedName) -and -not $isMs) { [void]$risk.Add('UnverifiedPublisher') }
         if ($creds.SecretCount -gt 0 -or $creds.CertCount -gt 0) { [void]$risk.Add('LocalCredentialsOnSp') }
+        if (-not $isMs -and -not $gallery.InGallery) { [void]$risk.Add('NonGalleryApp') }
         foreach ($f in @($redirectFlags | Select-Object -Unique)) { [void]$risk.Add($f) }
 
         $severity = 'Low'
@@ -1794,6 +2066,10 @@ function Collect-InboundExternalServicePrincipals {
                 GroupMembershipCount           = $(if ($groupSummary.GroupCount -ge 0) { $groupSummary.GroupCount } else { '' })
                 OwnedObjects                   = $ownedSummary.Details
                 OwnedObjectCount               = $(if ($ownedSummary.OwnedCount -ge 0) { $ownedSummary.OwnedCount } else { '' })
+                AppGalleryListed               = $gallery.Status
+                InAppGallery                   = $gallery.InGallery
+                ApplicationTemplateId          = $gallery.TemplateId
+                GalleryTemplateName            = $gallery.TemplateName
                 ExchangeAppAccess              = $exchangeAccess
                 SignInCount                    = $(if ($signInSummary.SignInCount -ge 0) { $signInSummary.SignInCount } else { '' })
                 InteractiveUserSignIns         = $(if ($signInSummary.InteractiveUserCount -ge 0) { $signInSummary.InteractiveUserCount } else { '' })
@@ -1826,6 +2102,7 @@ function Collect-InboundExternalServicePrincipals {
                         if ($ownerSummary.OwnerCount -eq 0) { 'No owners on this enterprise app — assign an accountable admin.' }
                         if ($assignedToSummary.AssignmentCount -gt 0) { 'Users/groups are assigned to this app — see AssignedPrincipals.' }
                         if ($signInSummary.SignInCount -eq 0) { 'No app sign-ins in the lookback window — candidate for removal if unused.' }
+                        if (-not $isMs -and -not $gallery.InGallery) { 'Not listed in the Microsoft Entra App Gallery (custom/non-gallery app) — verify it is expected and legitimate.' }
                         if ($enabled -eq $false) { 'Account disabled but object remains — confirm grants are revoked.' }
                         if ($isMs) { 'Microsoft first-party application (filtered in by -IncludeMicrosoftFirstParty).' }
                     ) -join ' '
@@ -1994,7 +2271,8 @@ function New-HtmlReport {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AllRows,
         [Parameter(Mandatory)][string]$RunFolder,
         [hashtable]$Meta,
-        [AllowEmptyCollection()][object[]]$SignInRecords = @()
+        [AllowEmptyCollection()][object[]]$SignInRecords = @(),
+        [AllowEmptyCollection()][object[]]$IpIntel = @()
     )
 
     $outbound = @($AllRows | Where-Object { $_.Direction -eq 'Outbound' })
@@ -2134,6 +2412,7 @@ function auditSort(th){
     [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Inbound enterprise apps</div></div>' -f (Get-ObjectCount $inbound)))
     [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Outbound app registrations</div></div>' -f (Get-ObjectCount $outbound)))
     [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Sign-in events captured</div></div>' -f (Get-ObjectCount $SignInRecords)))
+    [void]$sb.AppendLine(('<div class="card"><div class="n">{0}</div><div class="l">Unique source IPs</div></div>' -f (Get-ObjectCount $IpIntel)))
     [void]$sb.AppendLine('</div>')
 
     [void]$sb.AppendLine('<div class="legend"><span><span class="badge sev-high">High</span> privileged app perms / directory roles</span><span><span class="badge sev-med">Medium</span> consented perms / owned objects</span><span><span class="badge sev-low">Low</span> presence only</span></div>')
@@ -2149,9 +2428,9 @@ function auditSort(th){
     [void]$sb.AppendLine('<select class="f-sev" onchange="auditFilter(''sec-inbound'')"><option value="">All severities</option><option>High</option><option>Medium</option><option>Low</option></select>')
     [void]$sb.AppendLine('<span class="f-count muted"></span>')
     [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
-    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Severity</th><th onclick="auditSort(this)">DisplayName</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Home tenant</th><th onclick="auditSort(this)">Risk flags</th><th onclick="auditSort(this)">Admin-consent permissions</th><th onclick="auditSort(this)">User-consent permissions</th><th onclick="auditSort(this)">Directory roles</th><th onclick="auditSort(this)">Eligible (PIM) roles</th><th onclick="auditSort(this)">Group memberships</th><th onclick="auditSort(this)">Owned objects</th><th onclick="auditSort(this)">Owners / admins</th><th onclick="auditSort(this)">Assigned users/groups</th><th onclick="auditSort(this)">Exchange access</th><th onclick="auditSort(this)">Sign-ins (total; int/non-int/SP/MI)</th><th onclick="auditSort(this)">Notes</th></tr></thead><tbody>')
+    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Severity</th><th onclick="auditSort(this)">DisplayName</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Homepage</th><th onclick="auditSort(this)">Home tenant</th><th onclick="auditSort(this)">Enabled</th><th onclick="auditSort(this)">App Gallery</th><th onclick="auditSort(this)">Risk flags</th><th onclick="auditSort(this)">Admin-consent permissions</th><th onclick="auditSort(this)">User-consent permissions</th><th onclick="auditSort(this)">Directory roles</th><th onclick="auditSort(this)">Eligible (PIM) roles</th><th onclick="auditSort(this)">Group memberships</th><th onclick="auditSort(this)">Owned objects</th><th onclick="auditSort(this)">Owners / admins</th><th onclick="auditSort(this)">Assigned users/groups</th><th onclick="auditSort(this)">Exchange access</th><th onclick="auditSort(this)">Sign-ins (total; int/non-int/SP/MI)</th><th onclick="auditSort(this)">Notes</th></tr></thead><tbody>')
     if ($inboundSorted.Count -eq 0) {
-        [void]$sb.AppendLine('<tr><td colspan="16" class="muted">No inbound external service principals in this run.</td></tr>')
+        [void]$sb.AppendLine('<tr><td colspan="19" class="muted">No inbound external service principals in this run.</td></tr>')
     }
     else {
         foreach ($r in $inboundSorted) {
@@ -2168,13 +2447,41 @@ function auditSort(th){
             else {
                 ('<strong>{0}</strong><br/>{1}<br/><span class="muted">{2}</span>' -f (Esc $r.SignInCount), $breakdown, (Esc $r.LastSignIn))
             }
-            [void]$sb.AppendLine(('<tr class="{0}" data-sev="{1}"><td>{2}</td><td>{3}</td><td><code>{4}</code></td><td><code>{5}</code></td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td><td>{11}</td><td>{12}</td><td>{13}</td><td>{14}</td><td>{15}</td><td>{16}</td><td class="notes">{17}</td></tr>' -f `
+            $homepageCell = if ([string]::IsNullOrWhiteSpace([string]$r.Homepage)) {
+                '<span class="muted">&mdash;</span>'
+            }
+            else {
+                ('<a href="{0}" target="_blank" rel="noopener">{1}</a>' -f (Esc $r.Homepage), (Esc $r.Homepage))
+            }
+            $enabledCell = if ($r.AccountEnabled -eq $true) {
+                '<span class="pill" style="background:#e6f4ea;color:#1e7e34;border-color:#bfe3c9">Enabled</span>'
+            }
+            elseif ($r.AccountEnabled -eq $false) {
+                '<span class="pill pill-hot">Disabled</span>'
+            }
+            else {
+                '<span class="muted">unknown</span>'
+            }
+            $galleryCell = if ($r.InAppGallery -eq $true) {
+                $gname = if ([string]::IsNullOrWhiteSpace([string]$r.GalleryTemplateName)) { 'Gallery' } else { [string]$r.GalleryTemplateName }
+                ('<span class="pill" style="background:#e8effb;color:#1f4e9c;border-color:#c4d6f5" title="{0}">Gallery</span>' -f (Esc $gname))
+            }
+            elseif ([string]$r.AppGalleryListed -match '(?i)custom|non-gallery') {
+                ('<span class="pill" style="background:#fff4e5;color:#8a5300;border-color:#f3dcae">{0}</span>' -f (Esc $r.AppGalleryListed))
+            }
+            else {
+                '<span class="muted">&mdash;</span>'
+            }
+            [void]$sb.AppendLine(('<tr class="{0}" data-sev="{1}"><td>{2}</td><td>{3}</td><td><code>{4}</code></td><td>{5}</td><td><code>{6}</code></td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td><td>{11}</td><td>{12}</td><td>{13}</td><td>{14}</td><td>{15}</td><td>{16}</td><td>{17}</td><td>{18}</td><td>{19}</td><td class="notes">{20}</td></tr>' -f `
                     $rowcls,
                     (Esc $r.Severity),
                     (Get-SevBadge $r.Severity),
                     (Esc $r.DisplayName),
                     (Esc $r.AppId),
+                    $homepageCell,
                     (Esc $r.HomeTenantId),
+                    $enabledCell,
+                    $galleryCell,
                     (Format-RiskPills $r.RiskFlags),
                     (Format-CollapsibleCell $r.AdminConsentPermissions ' || '),
                     (Format-CollapsibleCell $r.UserConsentPermissions ' || '),
@@ -2193,43 +2500,88 @@ function auditSort(th){
     [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Admin consent = application permissions (appRoleAssignments) + delegated grants with consentType=AllPrincipals. User consent = delegated grants with consentType=Principal (per user). Sign-ins = app-only sign-ins in the lookback window (requires Entra ID P1).</p>')
     [void]$sb.AppendLine('</section>')
 
-    # ---- Sign-in activity detail section ----
-    $signInSorted = @($SignInRecords | Sort-Object @{ Expression = { $_.Time }; Descending = $true })
-    [void]$sb.AppendLine('<section id="sec-signins">')
-    [void]$sb.AppendLine('<h2>Sign-in activity detail &mdash; per-event log</h2>')
-    [void]$sb.AppendLine('<div class="controls">')
-    [void]$sb.AppendLine('<input type="search" class="f-search" placeholder="Search by app, user, IP, status, resource..." oninput="auditFilter(''sec-signins'')"/>')
-    [void]$sb.AppendLine('<span class="f-count muted"></span>')
-    [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
-    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Time (UTC)</th><th onclick="auditSort(this)">Service principal</th><th onclick="auditSort(this)">AppId</th><th onclick="auditSort(this)">Identity</th><th onclick="auditSort(this)">Event type</th><th onclick="auditSort(this)">IP address</th><th onclick="auditSort(this)">Location</th><th onclick="auditSort(this)">Status</th><th onclick="auditSort(this)">Resource</th><th onclick="auditSort(this)">Client app</th></tr></thead><tbody>')
-    if ($signInSorted.Count -eq 0) {
-        [void]$sb.AppendLine('<tr><td colspan="10" class="muted">No sign-in events captured (sign-in collection skipped, unavailable, or no activity in the lookback window).</td></tr>')
+    # ---- Sign-in activity detail: one section per enterprise application ----
+    [void]$sb.AppendLine('<h2 style="margin:26px 4px 4px">Sign-in activity by application</h2>')
+    [void]$sb.AppendLine('<p class="muted" style="margin:0 4px 8px">Per-event sign-in logs for each inbound enterprise application (capped per app for performance). Includes interactive, non-interactive, service-principal, and managed-identity sign-ins. Full data is in multitenant-apps-signins.csv.</p>')
+
+    if ((Get-ObjectCount $SignInRecords) -eq 0) {
+        [void]$sb.AppendLine('<section id="sec-signins-empty"><p class="muted" style="margin:14px 18px">No sign-in events captured (sign-in collection skipped, unavailable, or no activity in the lookback window).</p></section>')
     }
     else {
-        foreach ($r in $signInSorted) {
-            $okBool = $false
-            try { $okBool = [bool]$r.StatusOk } catch { $okBool = $false }
-            $statusHtml = if ($okBool) {
-                ('<span class="pill" style="background:#e6f4ea;color:#1e7e34;border-color:#bfe3c9">{0}</span>' -f (Esc $r.Status))
+        $signInGroups = @($SignInRecords | Group-Object -Property AppId | Sort-Object -Property @{ Expression = { $_.Count }; Descending = $true }, Name)
+        $grpIdx = 0
+        foreach ($g in $signInGroups) {
+            $grpIdx++
+            $secId = "sec-signins-$grpIdx"
+            $first = $g.Group | Select-Object -First 1
+            $appName = [string]$first.ServicePrincipal
+            if ([string]::IsNullOrWhiteSpace($appName)) { $appName = '(unnamed application)' }
+            $appId = [string]$g.Name
+
+            [void]$sb.AppendLine(('<section id="{0}">' -f $secId))
+            [void]$sb.AppendLine(('<h2>{0} &nbsp;<code>{1}</code> &nbsp;<span class="muted" style="font-size:13px;font-weight:400">{2} events</span></h2>' -f (Esc $appName), (Esc $appId), $g.Count))
+            [void]$sb.AppendLine('<div class="controls">')
+            [void]$sb.AppendLine(('<input type="search" class="f-search" placeholder="Search this app''s sign-ins (user, IP, status, resource)..." oninput="auditFilter(''{0}'')"/>' -f $secId))
+            [void]$sb.AppendLine('<span class="f-count muted"></span>')
+            [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
+            [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">Time (UTC)</th><th onclick="auditSort(this)">Identity</th><th onclick="auditSort(this)">Event type</th><th onclick="auditSort(this)">IP address</th><th onclick="auditSort(this)">Location</th><th onclick="auditSort(this)">Status</th><th onclick="auditSort(this)">Resource</th><th onclick="auditSort(this)">Client app</th></tr></thead><tbody>')
+
+            $recordsSorted = @($g.Group | Sort-Object @{ Expression = { $_.Time }; Descending = $true })
+            foreach ($r in $recordsSorted) {
+                $okBool = $false
+                try { $okBool = [bool]$r.StatusOk } catch { $okBool = $false }
+                $statusHtml = if ($okBool) {
+                    ('<span class="pill" style="background:#e6f4ea;color:#1e7e34;border-color:#bfe3c9">{0}</span>' -f (Esc $r.Status))
+                }
+                else {
+                    ('<span class="pill pill-hot">{0}</span>' -f (Esc $r.Status))
+                }
+                [void]$sb.AppendLine(('<tr><td>{0}</td><td>{1}</td><td>{2}</td><td><code>{3}</code></td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td></tr>' -f `
+                        (Esc $r.Time),
+                        (Esc $r.Identity),
+                        (Esc $r.EventType),
+                        (Esc $r.IpAddress),
+                        (Esc $r.Location),
+                        $statusHtml,
+                        (Esc $r.Resource),
+                        (Esc $r.ClientApp)))
             }
-            else {
-                ('<span class="pill pill-hot">{0}</span>' -f (Esc $r.Status))
-            }
-            [void]$sb.AppendLine(('<tr><td>{0}</td><td>{1}</td><td><code>{2}</code></td><td>{3}</td><td>{4}</td><td><code>{5}</code></td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td></tr>' -f `
-                    (Esc $r.Time),
-                    (Esc $r.ServicePrincipal),
-                    (Esc $r.AppId),
-                    (Esc $r.Identity),
-                    (Esc $r.EventType),
+            [void]$sb.AppendLine('</tbody></table></div>')
+            [void]$sb.AppendLine('</section>')
+        }
+    }
+
+    # ---- Sign-in source IP intelligence section ----
+    $ipSorted = @($IpIntel | Sort-Object @{ Expression = { [int]$_.Events }; Descending = $true }, IpAddress)
+    [void]$sb.AppendLine('<section id="sec-ipintel">')
+    [void]$sb.AppendLine('<h2>Sign-in source IP intelligence &mdash; RDAP registrant &amp; reverse DNS</h2>')
+    [void]$sb.AppendLine('<div class="controls">')
+    [void]$sb.AppendLine('<input type="search" class="f-search" placeholder="Search by IP, registrant, host, network, country..." oninput="auditFilter(''sec-ipintel'')"/>')
+    [void]$sb.AppendLine('<span class="f-count muted"></span>')
+    [void]$sb.AppendLine('</div><div class="tbl-scroll"><table>')
+    [void]$sb.AppendLine('<thead><tr><th onclick="auditSort(this)">IP address</th><th onclick="auditSort(this)">Events</th><th onclick="auditSort(this)">Applications</th><th onclick="auditSort(this)">Reverse DNS (PTR)</th><th onclick="auditSort(this)">Registrant / org</th><th onclick="auditSort(this)">Network</th><th onclick="auditSort(this)">CIDR</th><th onclick="auditSort(this)">Country</th><th onclick="auditSort(this)">Last seen (UTC)</th><th onclick="auditSort(this)">Source</th></tr></thead><tbody>')
+    if ($ipSorted.Count -eq 0) {
+        [void]$sb.AppendLine('<tr><td colspan="10" class="muted">No source IPs to enrich (sign-in collection skipped/unavailable, or IP intelligence skipped with -SkipIpIntelligence).</td></tr>')
+    }
+    else {
+        foreach ($r in $ipSorted) {
+            $rdns = if ([string]::IsNullOrWhiteSpace([string]$r.ReverseDns)) { '<span class="muted">&mdash;</span>' } else { (Esc $r.ReverseDns) }
+            $reg = if ([string]::IsNullOrWhiteSpace([string]$r.Registrant)) { '<span class="muted">&mdash;</span>' } else { (Esc $r.Registrant) }
+            [void]$sb.AppendLine(('<tr><td><code>{0}</code></td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td><code>{6}</code></td><td>{7}</td><td>{8}</td><td><span class="muted" style="font-size:11px">{9}</span></td></tr>' -f `
                     (Esc $r.IpAddress),
-                    (Esc $r.Location),
-                    $statusHtml,
-                    (Esc $r.Resource),
-                    (Esc $r.ClientApp)))
+                    (Esc ([string]$r.Events)),
+                    (Format-CollapsibleCell ([string]$r.Applications) ';'),
+                    $rdns,
+                    $reg,
+                    (Esc $r.NetworkName),
+                    (Esc $r.Cidr),
+                    (Esc $r.Country),
+                    (Esc $r.LastSeen),
+                    (Esc $r.Source)))
         }
     }
     [void]$sb.AppendLine('</tbody></table></div>')
-    [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Per-event sign-in logs for the inbound service principals above (capped per app for performance). Includes interactive, non-interactive, service-principal, and managed-identity sign-ins. Full data is in multitenant-apps-signins.csv.</p>')
+    [void]$sb.AppendLine('<p class="muted" style="margin:10px 18px">Registrant/network/CIDR/country come from RDAP (rdap.org, which routes to the responsible RIR). Reverse DNS is the PTR record for the IP. Private/reserved (non-routable) addresses are flagged and not sent to RDAP. This reflects who owns the IP block, not necessarily the end user.</p>')
     [void]$sb.AppendLine('</section>')
 
     # ---- Outbound section ----
@@ -2314,20 +2666,27 @@ $allCsv = Join-Path $runFolder 'multitenant-apps-all.csv'
 $outCsv = Join-Path $runFolder 'multitenant-apps-outbound.csv'
 $inCsv = Join-Path $runFolder 'multitenant-apps-inbound.csv'
 $signInsCsv = Join-Path $runFolder 'multitenant-apps-signins.csv'
+$ipIntelCsv = Join-Path $runFolder 'multitenant-apps-ip-intel.csv'
 $html = Join-Path $runFolder 'multitenant-apps-report.html'
 
 $signInRecords = ConvertTo-ObjectArray $Script:SignInDetailRecords
+
+$ipIntel = @()
+if (-not $SkipIpIntelligence -and (Get-ObjectCount $signInRecords) -gt 0) {
+    $ipIntel = ConvertTo-ObjectArray (Get-SignInIpIntelligence -SignInRecords $signInRecords)
+}
 
 Export-AuditCsv -Rows $allRows -Path $allCsv
 Export-AuditCsv -Rows $outboundRows -Path $outCsv
 Export-AuditCsv -Rows $inboundRows -Path $inCsv
 Export-AuditCsv -Rows $signInRecords -Path $signInsCsv
+Export-AuditCsv -Rows $ipIntel -Path $ipIntelCsv
 
 $reportMeta = @{
     ScopeNote          = 'Scopes: Application.Read.All, Directory.Read.All, DelegatedPermissionGrant.Read.All, RoleManagement.Read.Directory, AuditLog.Read.All' + $(if ($IncludeExchange) { ' + Exchange Online RBAC' } else { '' })
     SignInLookbackDays = $SignInLookbackDays
 }
-New-HtmlReport -Path $html -Org $org -AllRows $allRows -RunFolder $runFolder -Meta $reportMeta -SignInRecords $signInRecords
+New-HtmlReport -Path $html -Org $org -AllRows $allRows -RunFolder $runFolder -Meta $reportMeta -SignInRecords $signInRecords -IpIntel $ipIntel
 
 $summary = [PSCustomObject]@{
     TenantId                     = $resolvedTenantId
@@ -2341,6 +2700,9 @@ $summary = [PSCustomObject]@{
     IncludeExchange              = [bool]$IncludeExchange
     SignInActivityCollected      = [bool]$collectSignIns
     SignInLookbackDays           = $SignInLookbackDays
+    SignInEventsCaptured         = (Get-ObjectCount $signInRecords)
+    UniqueSourceIpCount          = (Get-ObjectCount $ipIntel)
+    IpIntelligenceCollected      = [bool](-not $SkipIpIntelligence)
     GeneratedUtc                 = [DateTime]::UtcNow.ToString('o')
 }
 $summary | ConvertTo-Json | Set-Content -Path (Join-Path $runFolder 'summary.json') -Encoding UTF8
@@ -2351,6 +2713,7 @@ Write-Host "  $allCsv"
 Write-Host "  $outCsv"
 Write-Host "  $inCsv"
 Write-Host "  $signInsCsv"
+Write-Host "  $ipIntelCsv"
 Write-Host "  $html"
 Write-Host ("  summary: outbound={0}; inbound={1}; high={2}; medium={3}" -f `
         $summary.OutboundMultiTenantAppCount, $summary.InboundExternalSpCount, $summary.HighSeverityCount, $summary.MediumSeverityCount)
