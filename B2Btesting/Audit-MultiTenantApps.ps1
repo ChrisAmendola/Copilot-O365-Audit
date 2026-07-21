@@ -249,14 +249,19 @@ function Invoke-GraphRequestWithRetry {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [string]$Method = 'GET',
-        [int]$MaxAttempts = 5
+        [int]$MaxAttempts = 5,
+        $Body = $null,
+        [string]$ContentType
     )
 
     $attempt = 0
     while ($true) {
         $attempt++
         try {
-            return Invoke-MgGraphRequest -Method $Method -Uri $Uri -ErrorAction Stop
+            $params = @{ Method = $Method; Uri = $Uri; ErrorAction = 'Stop' }
+            if ($null -ne $Body) { $params['Body'] = $Body }
+            if ($ContentType) { $params['ContentType'] = $ContentType }
+            return Invoke-MgGraphRequest @params
         }
         catch {
             $status = $null
@@ -292,6 +297,96 @@ function Get-GraphPaged {
     }
     # Comma prevents PowerShell from unwrapping a single-element array (breaks .Count under StrictMode).
     return , @($items.ToArray())
+}
+
+function Invoke-GraphBatch {
+    <#
+        Execute several independent GET requests in a single Microsoft Graph JSON $batch call
+        (up to 20 per batch). Returns a hashtable keyed by the caller's request Name:
+          value = an array of rows (the sub-response body's `value`) when the sub-request
+                  returned HTTP 200 on a single page;
+          $null = the sub-request failed, was throttled, or is paged (has @odata.nextLink).
+
+        A $null entry signals the caller to fall back to a reliable live (paged, retried) fetch,
+        so batching is a pure optimization that never changes results. On any outer failure the
+        whole map is returned all-$null (every read falls back to live).
+
+        Each request is @{ Name = '<key>'; Url = '/relative/graph/url' } (relative to /v1.0).
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Requests)
+
+    $result = @{}
+    foreach ($r in $Requests) { $result[$r.Name] = $null }
+    if ($Requests.Count -eq 0) { return $result }
+
+    # Batch responses can be returned out of order, so correlate by a numeric id.
+    $idToName = @{}
+    $subRequests = [System.Collections.Generic.List[object]]::new()
+    $n = 0
+    foreach ($r in $Requests) {
+        $n++
+        $id = [string]$n
+        $idToName[$id] = $r.Name
+        [void]$subRequests.Add([ordered]@{ id = $id; method = 'GET'; url = $r.Url })
+    }
+    $bodyJson = (@{ requests = $subRequests } | ConvertTo-Json -Depth 6)
+
+    try {
+        $resp = Invoke-GraphRequestWithRetry -Method POST -Uri 'https://graph.microsoft.com/v1.0/$batch' -Body $bodyJson -ContentType 'application/json'
+    }
+    catch {
+        return $result
+    }
+
+    foreach ($item in (ConvertTo-ObjectArray (Get-GraphProp -Object $resp -Name 'responses'))) {
+        if (-not (Test-IsGraphRowObject $item)) { continue }
+        $id = [string](Get-GraphProp -Object $item -Name 'id')
+        if (-not $idToName.ContainsKey($id)) { continue }
+        $name = $idToName[$id]
+
+        $status = 0
+        try { $status = [int](Get-GraphProp -Object $item -Name 'status') } catch { $status = 0 }
+        if ($status -ne 200) { continue }   # leave $null -> live fallback
+
+        $body = Get-GraphProp -Object $item -Name 'body'
+        if ($body -is [string]) {
+            try { $body = $body | ConvertFrom-Json } catch { continue }
+        }
+        if (-not $body) { continue }
+
+        # Paged sub-response: batch only returns the first page, so defer to a full live fetch.
+        if ([string](Get-GraphProp -Object $body -Name '@odata.nextLink')) { continue }
+
+        $result[$name] = ConvertTo-ObjectArray (Get-GraphProp -Object $body -Name 'value')
+    }
+
+    return $result
+}
+
+function Get-SpBatchReads {
+    <#
+        Fetch all the per-service-principal directory reads (app-role assignments, oauth2 grants,
+        directory roles, PIM-eligible roles, owners, assigned principals, group memberships, owned
+        objects) in ONE Graph $batch round-trip instead of ~9 serial calls. Returns the
+        Invoke-GraphBatch map (Name -> rows or $null). Sign-ins are NOT included (they use the
+        high-latency /beta store and are collected separately in bulk).
+    #>
+    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+
+    $encClient = [uri]::EscapeDataString("clientId eq '$ServicePrincipalId'")
+    $encPrincipal = [uri]::EscapeDataString("principalId eq '$ServicePrincipalId'")
+    $reqs = @(
+        [PSCustomObject]@{ Name = 'appRoles';          Url = ("/servicePrincipals/{0}/appRoleAssignments" -f $ServicePrincipalId) }
+        [PSCustomObject]@{ Name = 'oauth2';            Url = ("/oauth2PermissionGrants?`$filter={0}" -f $encClient) }
+        [PSCustomObject]@{ Name = 'dirRoleMemberOf';   Url = ("/servicePrincipals/{0}/memberOf/microsoft.graph.directoryRole" -f $ServicePrincipalId) }
+        [PSCustomObject]@{ Name = 'roleAssignments';   Url = ("/roleManagement/directory/roleAssignments?`$filter={0}" -f $encPrincipal) }
+        [PSCustomObject]@{ Name = 'eligible';          Url = ("/roleManagement/directory/roleEligibilityScheduleInstances?`$filter={0}" -f $encPrincipal) }
+        [PSCustomObject]@{ Name = 'owners';            Url = ("/servicePrincipals/{0}/owners?`$select=id,displayName,userPrincipalName" -f $ServicePrincipalId) }
+        [PSCustomObject]@{ Name = 'appRoleAssignedTo'; Url = ("/servicePrincipals/{0}/appRoleAssignedTo" -f $ServicePrincipalId) }
+        [PSCustomObject]@{ Name = 'groups';            Url = ("/servicePrincipals/{0}/memberOf/microsoft.graph.group?`$select=id,displayName,securityEnabled,isAssignableToRole" -f $ServicePrincipalId) }
+        [PSCustomObject]@{ Name = 'owned';             Url = ("/servicePrincipals/{0}/ownedObjects?`$select=id,displayName" -f $ServicePrincipalId) }
+    )
+    return (Invoke-GraphBatch -Requests $reqs)
 }
 
 function Test-IsMicrosoftTenantId {
@@ -1067,15 +1162,20 @@ function Collect-OutboundMultiTenantApps {
 }
 
 function Get-SpAppRoleAssignmentSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId, $GraphRoleMap)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $GraphRoleMap, $PreFetched = $null)
 
     $high = [System.Collections.Generic.List[string]]::new()
     $details = [System.Collections.Generic.List[string]]::new()
-    try {
-        $assignments = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignments" -f $ServicePrincipalId))
+    if ($PreFetched -is [System.Array]) {
+        $assignments = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{ AssignmentCount = -1; HighRiskCount = 0; HighRisk = ''; Details = '' }
+    else {
+        try {
+            $assignments = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignments" -f $ServicePrincipalId))
+        }
+        catch {
+            return [PSCustomObject]@{ AssignmentCount = -1; HighRiskCount = 0; HighRisk = ''; Details = '' }
+        }
     }
 
     foreach ($a in $assignments) {
@@ -1140,7 +1240,7 @@ function Resolve-ConsentPrincipalLabel {
 }
 
 function Get-SpOauth2GrantSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId, $GraphRoleMap)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $GraphRoleMap, $PreFetched = $null)
 
     # oauth2PermissionGrants:
     #   consentType=AllPrincipals => admin consent (tenant-wide)
@@ -1151,13 +1251,17 @@ function Get-SpOauth2GrantSummary {
     $userScopes = [System.Collections.Generic.List[string]]::new()
     $high = [System.Collections.Generic.List[string]]::new()
 
-    try {
-        $filter = [uri]::EscapeDataString("clientId eq '$ServicePrincipalId'")
-        $grants = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$filter={0}' -f $filter))
+    if ($PreFetched -is [System.Array]) {
+        $grants = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{
-            GrantCount              = -1
+    else {
+        try {
+            $filter = [uri]::EscapeDataString("clientId eq '$ServicePrincipalId'")
+            $grants = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$filter={0}' -f $filter))
+        }
+        catch {
+            return [PSCustomObject]@{
+                GrantCount              = -1
             ScopeCount              = -1
             AdminGrantCount         = -1
             UserGrantCount          = -1
@@ -1170,6 +1274,7 @@ function Get-SpOauth2GrantSummary {
             UserConsentDetails      = ''
             AdminConsentScopes      = ''
             UserConsentScopes       = ''
+            }
         }
     }
 
@@ -1244,59 +1349,82 @@ function Get-SpOauth2GrantSummary {
 }
 
 function Get-SpDirectoryRoleSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+    param(
+        [Parameter(Mandatory)][string]$ServicePrincipalId,
+        $PreFetchedMemberOf = $null,
+        $PreFetchedRoleAssignments = $null
+    )
 
     $roles = [System.Collections.Generic.List[string]]::new()
 
     # Cast to directoryRole so groups are excluded; do not $select away @odata.type.
-    try {
-        $members = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf/microsoft.graph.directoryRole" -f $ServicePrincipalId))
-        foreach ($m in $members) {
+    if ($PreFetchedMemberOf -is [System.Array]) {
+        # Batched typed memberOf. A successful (200) empty result means no directory roles, so
+        # the untyped fallback is unnecessary (it only helps when the cast segment errors, which
+        # yields a non-200 sub-response -> $null here -> the live path below runs the fallback).
+        foreach ($m in (ConvertTo-ObjectArray $PreFetchedMemberOf)) {
             if (-not (Test-IsGraphRowObject $m)) { continue }
             $name = [string](Get-GraphProp -Object $m -Name 'displayName')
             if ($name -and -not ($roles -contains $name)) { [void]$roles.Add($name) }
         }
     }
-    catch { }
-
-    # Fallback: untyped memberOf, keep only directoryRole types.
-    if ($roles.Count -eq 0) {
+    else {
         try {
-            $members = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf" -f $ServicePrincipalId))
+            $members = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf/microsoft.graph.directoryRole" -f $ServicePrincipalId))
             foreach ($m in $members) {
                 if (-not (Test-IsGraphRowObject $m)) { continue }
-                $odataType = [string](Get-GraphProp -Object $m -Name '@odata.type')
                 $name = [string](Get-GraphProp -Object $m -Name 'displayName')
-                if ($name -and $odataType -match 'directoryRole' -and -not ($roles -contains $name)) {
-                    [void]$roles.Add($name)
-                }
+                if ($name -and -not ($roles -contains $name)) { [void]$roles.Add($name) }
             }
         }
         catch { }
+
+        # Fallback: untyped memberOf, keep only directoryRole types.
+        if ($roles.Count -eq 0) {
+            try {
+                $members = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf" -f $ServicePrincipalId))
+                foreach ($m in $members) {
+                    if (-not (Test-IsGraphRowObject $m)) { continue }
+                    $odataType = [string](Get-GraphProp -Object $m -Name '@odata.type')
+                    $name = [string](Get-GraphProp -Object $m -Name 'displayName')
+                    if ($name -and $odataType -match 'directoryRole' -and -not ($roles -contains $name)) {
+                        [void]$roles.Add($name)
+                    }
+                }
+            }
+            catch { }
+        }
     }
 
     # Unified role assignments (directory roles assigned to the SP).
-    try {
-        $filter = [uri]::EscapeDataString("principalId eq '$ServicePrincipalId'")
-        $assignments = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$filter={0}' -f $filter))
-        foreach ($ra in $assignments) {
-            if (-not (Test-IsGraphRowObject $ra)) { continue }
-            $roleDefId = [string](Get-GraphProp -Object $ra -Name 'roleDefinitionId')
-            $rn = $null
-            if ($roleDefId) {
-                try {
-                    $rd = Invoke-MgGraphRequest -Method GET `
-                        -Uri ("https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions/{0}?`$select=displayName" -f $roleDefId) `
-                        -ErrorAction Stop
-                    $rn = [string](Get-GraphProp -Object $rd -Name 'displayName')
-                }
-                catch { }
-            }
-            if (-not $rn) { $rn = $roleDefId }
-            if ($rn -and -not ($roles -contains $rn)) { [void]$roles.Add($rn) }
-        }
+    $assignments = $null
+    if ($PreFetchedRoleAssignments -is [System.Array]) {
+        $assignments = ConvertTo-ObjectArray $PreFetchedRoleAssignments
     }
-    catch { }
+    else {
+        try {
+            $filter = [uri]::EscapeDataString("principalId eq '$ServicePrincipalId'")
+            $assignments = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$filter={0}' -f $filter))
+        }
+        catch { $assignments = @() }
+    }
+
+    foreach ($ra in $assignments) {
+        if (-not (Test-IsGraphRowObject $ra)) { continue }
+        $roleDefId = [string](Get-GraphProp -Object $ra -Name 'roleDefinitionId')
+        $rn = $null
+        if ($roleDefId) {
+            try {
+                $rd = Invoke-MgGraphRequest -Method GET `
+                    -Uri ("https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions/{0}?`$select=displayName" -f $roleDefId) `
+                    -ErrorAction Stop
+                $rn = [string](Get-GraphProp -Object $rd -Name 'displayName')
+            }
+            catch { }
+        }
+        if (-not $rn) { $rn = $roleDefId }
+        if ($rn -and -not ($roles -contains $rn)) { [void]$roles.Add($rn) }
+    }
 
     return [PSCustomObject]@{
         RoleCount = $roles.Count
@@ -1305,14 +1433,19 @@ function Get-SpDirectoryRoleSummary {
 }
 
 function Get-SpOwnerSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $PreFetched = $null)
 
     $owners = [System.Collections.Generic.List[string]]::new()
-    try {
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/owners?`$select=id,displayName,userPrincipalName" -f $ServicePrincipalId))
+    if ($PreFetched -is [System.Array]) {
+        $rows = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{ OwnerCount = -1; Details = '' }
+    else {
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/owners?`$select=id,displayName,userPrincipalName" -f $ServicePrincipalId))
+        }
+        catch {
+            return [PSCustomObject]@{ OwnerCount = -1; Details = '' }
+        }
     }
 
     foreach ($o in $rows) {
@@ -1331,15 +1464,20 @@ function Get-SpOwnerSummary {
 }
 
 function Get-SpAppRoleAssignedToSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId, $GraphRoleMap)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $GraphRoleMap, $PreFetched = $null)
 
     # Users/groups/SPs assigned to this enterprise app (Entra "Users and groups").
     $entries = [System.Collections.Generic.List[string]]::new()
-    try {
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignedTo" -f $ServicePrincipalId))
+    if ($PreFetched -is [System.Array]) {
+        $rows = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{ AssignmentCount = -1; Details = '' }
+    else {
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignedTo" -f $ServicePrincipalId))
+        }
+        catch {
+            return [PSCustomObject]@{ AssignmentCount = -1; Details = '' }
+        }
     }
 
     foreach ($a in $rows) {
@@ -1366,16 +1504,21 @@ function Get-SpAppRoleAssignedToSummary {
 }
 
 function Get-SpGroupMembershipSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $PreFetched = $null)
 
     # Security-group memberships can grant SharePoint/site access, app-role assignments,
     # or Conditional Access scoping indirectly — a common blind spot.
     $groups = [System.Collections.Generic.List[string]]::new()
-    try {
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf/microsoft.graph.group?`$select=id,displayName,securityEnabled,isAssignableToRole" -f $ServicePrincipalId))
+    if ($PreFetched -is [System.Array]) {
+        $rows = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{ GroupCount = -1; RoleAssignableCount = 0; Details = '' }
+    else {
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/memberOf/microsoft.graph.group?`$select=id,displayName,securityEnabled,isAssignableToRole" -f $ServicePrincipalId))
+        }
+        catch {
+            return [PSCustomObject]@{ GroupCount = -1; RoleAssignableCount = 0; Details = '' }
+        }
     }
 
     $roleAssignable = 0
@@ -1399,15 +1542,20 @@ function Get-SpGroupMembershipSummary {
 }
 
 function Get-SpOwnedObjectsSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $PreFetched = $null)
 
     # Objects this SP owns (apps/groups/SPs) — indirect privilege (can add credentials, members).
     $owned = [System.Collections.Generic.List[string]]::new()
-    try {
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/ownedObjects?`$select=id,displayName" -f $ServicePrincipalId))
+    if ($PreFetched -is [System.Array]) {
+        $rows = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{ OwnedCount = -1; Details = '' }
+    else {
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals/{0}/ownedObjects?`$select=id,displayName" -f $ServicePrincipalId))
+        }
+        catch {
+            return [PSCustomObject]@{ OwnedCount = -1; Details = '' }
+        }
     }
 
     foreach ($o in $rows) {
@@ -1427,17 +1575,22 @@ function Get-SpOwnedObjectsSummary {
 }
 
 function Get-SpEligibleRoleSummary {
-    param([Parameter(Mandatory)][string]$ServicePrincipalId)
+    param([Parameter(Mandatory)][string]$ServicePrincipalId, $PreFetched = $null)
 
     # PIM-eligible directory roles (not yet active). Requires RoleManagement.Read.Directory
     # and Entra ID P2; skip gracefully when unavailable.
     $roles = [System.Collections.Generic.List[string]]::new()
-    try {
-        $filter = [uri]::EscapeDataString("principalId eq '$ServicePrincipalId'")
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?$filter={0}' -f $filter))
+    if ($PreFetched -is [System.Array]) {
+        $rows = ConvertTo-ObjectArray $PreFetched
     }
-    catch {
-        return [PSCustomObject]@{ RoleCount = -1; Details = '' }
+    else {
+        try {
+            $filter = [uri]::EscapeDataString("principalId eq '$ServicePrincipalId'")
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances?$filter={0}' -f $filter))
+        }
+        catch {
+            return [PSCustomObject]@{ RoleCount = -1; Details = '' }
+        }
     }
 
     foreach ($r in $rows) {
@@ -1462,78 +1615,21 @@ function Get-SpEligibleRoleSummary {
     }
 }
 
-function Get-SpSignInSummary {
-    param(
-        [Parameter(Mandatory)][string]$AppId,
-        [int]$LookbackDays = 30
-    )
-
-    # Evidence of actual use for this appId across ALL sign-in categories:
-    #   interactiveUser + nonInteractiveUser = users signing INTO the app (delegated)
-    #   servicePrincipal                     = the app authenticating as itself (app-only)
-    #   managedIdentity                      = managed-identity sign-ins
-    # The signIns endpoint returns only interactive user sign-ins unless you filter on
-    # signInEventTypes, so each category is queried explicitly.
-    # Requires AuditLog.Read.All + Entra ID P1. Counts are -1 when unavailable.
-    $unavailable = [PSCustomObject]@{
-        SignInCount             = -1
-        LastSignIn              = ''
-        Details                 = ''
-        InteractiveUserCount    = -1
-        NonInteractiveUserCount = -1
-        ServicePrincipalCount   = -1
-        ManagedIdentityCount    = -1
-        Records                 = @()
-    }
-    if ([string]::IsNullOrWhiteSpace($AppId)) { return $unavailable }
-
-    $since = [DateTime]::UtcNow.AddDays(-[Math]::Abs($LookbackDays)).ToString('yyyy-MM-ddTHH:mm:ssZ')
-
-    # Performance: the signIns reporting store is high-latency, so pull ALL four event types in a
-    # SINGLE query per SP (one lambda OR'ing every type) and bucket rows client-side, rather than
-    # firing one slow query per type. Rows are capped (top x MaxPages) to keep the summary fast.
-    $allTypes = "signInEventTypes/any(t: t eq 'interactiveUser' or t eq 'nonInteractiveUser' or t eq 'servicePrincipal' or t eq 'managedIdentity')"
-    # Match sign-ins where this app is the CLIENT (appId) OR the RESOURCE (resourceId). resourceId
-    # is the resource's appId, so non-interactive/token flows where the SP is the resource are caught.
-    $combined = [uri]::EscapeDataString("(appId eq '$AppId' or resourceId eq '$AppId') and createdDateTime ge $since and $allTypes")
-    $clientOnly = [uri]::EscapeDataString("appId eq '$AppId' and createdDateTime ge $since and $allTypes")
-
-    # NOTE: signInEventTypes is only a filterable property on the /beta endpoint. The /v1.0 signIns
-    # endpoint returns interactive sign-ins only and rejects signInEventTypes filters, so /beta is required.
-    $rows = $null
-    $firstError = $null
-    try {
-        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $combined) -MaxPages 3)
-    }
-    catch {
-        $firstError = $_.Exception.Message
-        # Fall back to client-only filter if the combined (appId OR resourceId) filter is rejected.
-        try {
-            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $clientOnly) -MaxPages 3)
-        }
-        catch {
-            if (-not $firstError) { $firstError = $_.Exception.Message }
-            if ($firstError -and -not $Script:SignInErrorReported) {
-                $Script:SignInErrorReported = $true
-                $hint = ''
-                if ($firstError -match '403|Forbidden|Authorization_RequestDenied|insufficient') {
-                    $hint = ' (missing AuditLog.Read.All consent or no Entra ID P1 license; re-run with -ForceReconnect to grant the scope)'
-                }
-                elseif ($firstError -match '401|expired|InvalidAuthenticationToken') {
-                    $hint = ' (token expired; re-run with -ForceReconnect)'
-                }
-                Write-AuditMsg ("  WARNING: sign-in log queries failed - reporting n/a. First error: {0}{1}" -f $firstError, $hint) Warn
-            }
-            return $unavailable
-        }
-    }
+function ConvertTo-SignInSummary {
+    <#
+        Build a sign-in summary object (counts by event type, last sign-in, resource list,
+        and per-event Records) from a set of raw /beta/auditLogs/signIns rows. Shared by the
+        per-SP path (Get-SpSignInSummary) and the bulk path (Get-BulkSignInSummaries) so both
+        produce byte-identical summaries.
+    #>
+    param([AllowEmptyCollection()][object[]]$Rows = @())
 
     $overallLast = $null
     $resources = [System.Collections.Generic.List[string]]::new()
     $records = [System.Collections.Generic.List[object]]::new()
     $ic = 0; $ni = 0; $sp = 0; $mi = 0
     $total = 0
-    foreach ($s in $rows) {
+    foreach ($s in $Rows) {
         if (-not (Test-IsGraphRowObject $s)) { continue }
         $total++
         $created = [string](Get-GraphProp -Object $s -Name 'createdDateTime')
@@ -1612,6 +1708,147 @@ function Get-SpSignInSummary {
         ManagedIdentityCount    = $mi
         Records                 = $records.ToArray()
     }
+}
+
+function Get-SpSignInSummary {
+    param(
+        [Parameter(Mandatory)][string]$AppId,
+        [int]$LookbackDays = 30
+    )
+
+    # Evidence of actual use for this appId across ALL sign-in categories:
+    #   interactiveUser + nonInteractiveUser = users signing INTO the app (delegated)
+    #   servicePrincipal                     = the app authenticating as itself (app-only)
+    #   managedIdentity                      = managed-identity sign-ins
+    # The signIns endpoint returns only interactive user sign-ins unless you filter on
+    # signInEventTypes, so each category is queried explicitly.
+    # Requires AuditLog.Read.All + Entra ID P1. Counts are -1 when unavailable.
+    $unavailable = [PSCustomObject]@{
+        SignInCount             = -1
+        LastSignIn              = ''
+        Details                 = ''
+        InteractiveUserCount    = -1
+        NonInteractiveUserCount = -1
+        ServicePrincipalCount   = -1
+        ManagedIdentityCount    = -1
+        Records                 = @()
+    }
+    if ([string]::IsNullOrWhiteSpace($AppId)) { return $unavailable }
+
+    $since = [DateTime]::UtcNow.AddDays(-[Math]::Abs($LookbackDays)).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+    # Performance: the signIns reporting store is high-latency, so pull ALL four event types in a
+    # SINGLE query per SP (one lambda OR'ing every type) and bucket rows client-side, rather than
+    # firing one slow query per type. Rows are capped (top x MaxPages) to keep the summary fast.
+    $allTypes = "signInEventTypes/any(t: t eq 'interactiveUser' or t eq 'nonInteractiveUser' or t eq 'servicePrincipal' or t eq 'managedIdentity')"
+    # Match sign-ins where this app is the CLIENT (appId) OR the RESOURCE (resourceId). resourceId
+    # is the resource's appId, so non-interactive/token flows where the SP is the resource are caught.
+    $combined = [uri]::EscapeDataString("(appId eq '$AppId' or resourceId eq '$AppId') and createdDateTime ge $since and $allTypes")
+    $clientOnly = [uri]::EscapeDataString("appId eq '$AppId' and createdDateTime ge $since and $allTypes")
+
+    # NOTE: signInEventTypes is only a filterable property on the /beta endpoint. The /v1.0 signIns
+    # endpoint returns interactive sign-ins only and rejects signInEventTypes filters, so /beta is required.
+    $rows = $null
+    $firstError = $null
+    try {
+        $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $combined) -MaxPages 3)
+    }
+    catch {
+        $firstError = $_.Exception.Message
+        # Fall back to client-only filter if the combined (appId OR resourceId) filter is rejected.
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $clientOnly) -MaxPages 3)
+        }
+        catch {
+            if (-not $firstError) { $firstError = $_.Exception.Message }
+            if ($firstError -and -not $Script:SignInErrorReported) {
+                $Script:SignInErrorReported = $true
+                $hint = ''
+                if ($firstError -match '403|Forbidden|Authorization_RequestDenied|insufficient') {
+                    $hint = ' (missing AuditLog.Read.All consent or no Entra ID P1 license; re-run with -ForceReconnect to grant the scope)'
+                }
+                elseif ($firstError -match '401|expired|InvalidAuthenticationToken') {
+                    $hint = ' (token expired; re-run with -ForceReconnect)'
+                }
+                Write-AuditMsg ("  WARNING: sign-in log queries failed - reporting n/a. First error: {0}{1}" -f $firstError, $hint) Warn
+            }
+            return $unavailable
+        }
+    }
+
+    return (ConvertTo-SignInSummary -Rows $rows)
+}
+
+function Get-BulkSignInSummaries {
+    <#
+        Performance: the /beta/auditLogs/signIns reporting store is high-latency, so issuing one
+        query per service principal is the dominant cost of the inbound scan. Instead, pull sign-ins
+        for ALL target appIds in a handful of CHUNKED queries (each OR's several appIds/resourceIds),
+        then bucket rows client-side per appId.
+
+        Returns a hashtable keyed by lowercased appId -> sign-in summary object (same shape as
+        Get-SpSignInSummary). Returns $null on any failure so the caller can fall back to per-SP
+        queries. A row is attributed to an appId when its appId (client) OR resourceId (resource)
+        matches, mirroring the per-SP filter; rows are de-duplicated by id before bucketing.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$AppIds,
+        [int]$LookbackDays = 30,
+        [int]$ChunkSize = 6,
+        [int]$MaxPages = 15
+    )
+
+    $ids = @($AppIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    if ($ids.Count -eq 0) { return @{} }
+
+    $since = [DateTime]::UtcNow.AddDays(-[Math]::Abs($LookbackDays)).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $allTypes = "signInEventTypes/any(t: t eq 'interactiveUser' or t eq 'nonInteractiveUser' or t eq 'servicePrincipal' or t eq 'managedIdentity')"
+
+    # Fetch all rows across chunks, de-duplicated by sign-in id (a single row can be returned by two
+    # chunks when both its client appId and its resource appId are in our target set).
+    $rowsById = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    for ($start = 0; $start -lt $ids.Count; $start += $ChunkSize) {
+        $chunk = @($ids[$start..([Math]::Min($start + $ChunkSize - 1, $ids.Count - 1))])
+        $clauses = [System.Collections.Generic.List[string]]::new()
+        foreach ($id in $chunk) {
+            [void]$clauses.Add("appId eq '$id'")
+            [void]$clauses.Add("resourceId eq '$id'")
+        }
+        $appClause = '(' + ($clauses -join ' or ') + ')'
+        $filter = [uri]::EscapeDataString("$appClause and createdDateTime ge $since and $allTypes")
+        try {
+            $rows = ConvertTo-ObjectArray (Get-GraphPaged -Uri ('https://graph.microsoft.com/beta/auditLogs/signIns?$filter={0}&$top=100' -f $filter) -MaxPages $MaxPages)
+        }
+        catch {
+            # Any chunk failure aborts the bulk path; caller falls back to reliable per-SP queries.
+            return $null
+        }
+        foreach ($r in $rows) {
+            if (-not (Test-IsGraphRowObject $r)) { continue }
+            $rid = [string](Get-GraphProp -Object $r -Name 'id')
+            if ([string]::IsNullOrWhiteSpace($rid)) { $rid = [Guid]::NewGuid().ToString() }
+            if (-not $rowsById.ContainsKey($rid)) { $rowsById[$rid] = $r }
+        }
+    }
+
+    # Bucket rows per target appId (match on client appId OR resource resourceId).
+    $buckets = @{}
+    foreach ($id in $ids) { $buckets[$id.ToLowerInvariant()] = [System.Collections.Generic.List[object]]::new() }
+    foreach ($r in $rowsById.Values) {
+        $rowAppId = [string](Get-GraphProp -Object $r -Name 'appId')
+        $rowResId = [string](Get-GraphProp -Object $r -Name 'resourceId')
+        foreach ($key in @($rowAppId, $rowResId)) {
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            $k = $key.ToLowerInvariant()
+            if ($buckets.ContainsKey($k)) { [void]$buckets[$k].Add($r) }
+        }
+    }
+
+    $result = @{}
+    foreach ($k in $buckets.Keys) {
+        $result[$k] = ConvertTo-SignInSummary -Rows ($buckets[$k].ToArray())
+    }
+    return $result
 }
 
 #region IP intelligence (RDAP + reverse DNS)
@@ -1886,22 +2123,44 @@ function Collect-InboundExternalServicePrincipals {
         Write-AuditMsg '  WARNING: only <=1 service principal returned. Every tenant has many first-party SPs, so this usually means the Graph token is stale/expired or lacks Directory.Read.All. Re-run with -ForceReconnect to get a fresh sign-in.' Warn
     }
 
-    $rows = [System.Collections.Generic.List[object]]::new()
-    $i = 0
+    # Pre-filter to external SPs (home tenant differs; optionally include Microsoft first-party)
+    # so we know the full working set before profiling — needed for bulk sign-in collection.
+    $externalSps = [System.Collections.Generic.List[object]]::new()
     foreach ($sp in $sps) {
         $homeTenantId = [string](Get-GraphProp -Object $sp -Name 'appOwnerOrganizationId')
         if ([string]::IsNullOrWhiteSpace($homeTenantId)) { continue }
         if ([string]::Equals($homeTenantId, $TenantOrgId, [StringComparison]::OrdinalIgnoreCase)) { continue }
-
         $isMs = Test-IsMicrosoftTenantId -OrgId $homeTenantId
         if ($isMs -and -not $IncludeMicrosoft) { continue }
+        [void]$externalSps.Add($sp)
+    }
+    Write-AuditMsg ("  {0} external service principal(s) to profile." -f $externalSps.Count)
+
+    # Performance: fetch sign-in evidence for ALL external apps in a few CHUNKED bulk queries
+    # instead of one high-latency /beta query per SP (the dominant cost). $null return => the
+    # bulk path failed, so we fall back to reliable per-SP queries inside the loop.
+    $bulkSignIns = $null
+    if ($CollectSignIns -and $externalSps.Count -gt 0) {
+        $externalAppIds = @($externalSps | ForEach-Object { [string](Get-GraphProp -Object $_ -Name 'appId') } | Where-Object { $_ })
+        Write-AuditMsg ("  querying sign-in logs in bulk ({0}d; interactive/non-interactive/SP/MI) for {1} app(s)..." -f $SignInLookbackDays, $externalAppIds.Count)
+        $bulkSignIns = Get-BulkSignInSummaries -AppIds $externalAppIds -LookbackDays $SignInLookbackDays
+        if ($null -eq $bulkSignIns) {
+            Write-AuditMsg '  bulk sign-in query unavailable; falling back to per-app queries.' Warn
+        }
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $i = 0
+    foreach ($sp in $externalSps) {
+        $homeTenantId = [string](Get-GraphProp -Object $sp -Name 'appOwnerOrganizationId')
+        $isMs = Test-IsMicrosoftTenantId -OrgId $homeTenantId
 
         $i++
 
         $spId = [string](Get-GraphProp -Object $sp -Name 'id')
         $appId = [string](Get-GraphProp -Object $sp -Name 'appId')
         $name = [string](Get-GraphProp -Object $sp -Name 'displayName')
-        Write-AuditMsg ("  [{0}] {1} - collecting permissions, roles, memberships..." -f $i, $name)
+        Write-AuditMsg ("  [{0}/{1}] {2} - collecting permissions, roles, memberships..." -f $i, $externalSps.Count, $name)
         $enabled = Get-GraphProp -Object $sp -Name 'accountEnabled'
         $verified = Get-GraphProp -Object $sp -Name 'verifiedPublisher'
         $verifiedName = [string](Get-GraphProp -Object $verified -Name 'displayName')
@@ -1911,17 +2170,32 @@ function Collect-InboundExternalServicePrincipals {
             -KeyCredentials (Get-GraphProp -Object $sp -Name 'keyCredentials') `
             -PasswordCredentials (Get-GraphProp -Object $sp -Name 'passwordCredentials')
 
-        $roleSummary = Get-SpAppRoleAssignmentSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap
-        $grantSummary = Get-SpOauth2GrantSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap
-        $dirRoles = Get-SpDirectoryRoleSummary -ServicePrincipalId $spId
-        $eligibleRoles = Get-SpEligibleRoleSummary -ServicePrincipalId $spId
-        $ownerSummary = Get-SpOwnerSummary -ServicePrincipalId $spId
-        $assignedToSummary = Get-SpAppRoleAssignedToSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap
-        $groupSummary = Get-SpGroupMembershipSummary -ServicePrincipalId $spId
-        $ownedSummary = Get-SpOwnedObjectsSummary -ServicePrincipalId $spId
+        # Fetch all independent directory reads for this SP in ONE Graph $batch round-trip
+        # instead of ~9 serial calls. Any read that batching can't satisfy (non-200 or paged)
+        # comes back $null and the helper transparently falls back to a live paged fetch.
+        $batchData = Get-SpBatchReads -ServicePrincipalId $spId
+        $roleSummary = Get-SpAppRoleAssignmentSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap -PreFetched $batchData.appRoles
+        $grantSummary = Get-SpOauth2GrantSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap -PreFetched $batchData.oauth2
+        $dirRoles = Get-SpDirectoryRoleSummary -ServicePrincipalId $spId -PreFetchedMemberOf $batchData.dirRoleMemberOf -PreFetchedRoleAssignments $batchData.roleAssignments
+        $eligibleRoles = Get-SpEligibleRoleSummary -ServicePrincipalId $spId -PreFetched $batchData.eligible
+        $ownerSummary = Get-SpOwnerSummary -ServicePrincipalId $spId -PreFetched $batchData.owners
+        $assignedToSummary = Get-SpAppRoleAssignedToSummary -ServicePrincipalId $spId -GraphRoleMap $GraphRoleMap -PreFetched $batchData.appRoleAssignedTo
+        $groupSummary = Get-SpGroupMembershipSummary -ServicePrincipalId $spId -PreFetched $batchData.groups
+        $ownedSummary = Get-SpOwnedObjectsSummary -ServicePrincipalId $spId -PreFetched $batchData.owned
         $signInSummary = if ($CollectSignIns) {
-            Write-AuditMsg ("      querying sign-in logs ({0}d; interactive/non-interactive/SP/MI)..." -f $SignInLookbackDays)
-            Get-SpSignInSummary -AppId $appId -LookbackDays $SignInLookbackDays
+            $fromBulk = $null
+            if ($bulkSignIns -and $appId -and $bulkSignIns.ContainsKey($appId.ToLowerInvariant())) {
+                $fromBulk = $bulkSignIns[$appId.ToLowerInvariant()]
+            }
+            if ($fromBulk) {
+                # Pre-fetched via the bulk query (includes zero-sign-in results).
+                $fromBulk
+            }
+            else {
+                # Bulk unavailable (query failed or app absent) -> per-SP query.
+                Write-AuditMsg ("      querying sign-in logs ({0}d; interactive/non-interactive/SP/MI)..." -f $SignInLookbackDays)
+                Get-SpSignInSummary -AppId $appId -LookbackDays $SignInLookbackDays
+            }
         }
         else {
             [PSCustomObject]@{

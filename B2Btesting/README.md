@@ -188,16 +188,21 @@ The audit correlates several Entra/Graph surfaces per inbound service principal 
 | Owners / assigned users & groups | `owners`, `appRoleAssignedTo` |
 | Credentials | `keyCredentials` / `passwordCredentials` |
 | **Federated identity credentials** (outbound apps) | `applications/{id}/federatedIdentityCredentials` |
-| **Sign-in evidence** (actual use, all four categories: interactive user, non-interactive user, service principal, managed identity) | `auditLogs/signIns?$filter=appId eq … and signInEventTypes/any(t: t eq '<type>')` (Entra ID P1) |
+| **Sign-in evidence** (actual use, all four categories: interactive user, non-interactive user, service principal, managed identity) | `beta/auditLogs/signIns?$filter=(appId eq … or resourceId eq …) and signInEventTypes/any(t: t eq 'interactiveUser' or …)` — the **`/beta`** endpoint is required because `signInEventTypes` is not filterable on `/v1.0`; matching both `appId` (client) and `resourceId` (resource) catches non-interactive/token flows. Requires Entra ID P1. |
+| **App Gallery listing** | `servicePrincipals/{id}.applicationTemplateId` + `applicationTemplates/{id}` (Gallery vs non-gallery/custom) |
+| **Source-IP intelligence** (per sign-in IP) | Reverse DNS (PTR) + RDAP (`rdap.org/ip/{ip}`) for registrant/org, network, CIDR, country — cached by the returned subnet range so IPs in the same allocation reuse one lookup |
 | **Exchange app RBAC + access policies** (`-IncludeExchange`) | `Get-ServicePrincipal`, `Get-ManagementRoleAssignment`, `Get-ApplicationAccessPolicy` |
 
 ### Security fields / risk flags
 
 Reports include (among others):
 
-- AppId, display name, home tenant id, verified publisher
+- AppId, display name, home tenant id, verified publisher, **homepage URL**, **account enabled/disabled** state
+- **App Gallery status** — whether the enterprise app is listed in the Microsoft Entra App Gallery (Gallery vs non-gallery/custom); non-gallery third-party apps get a `NonGalleryApp` flag
 - **Outbound:** requested permissions from `requiredResourceAccess` (application + delegated), federated identity credentials, with high-risk highlights
 - **Inbound service principals:** granted **application permissions**, **delegated scopes** split by **admin consent** (`AllPrincipals`) vs **user consent** (`Principal`), active + **PIM-eligible directory roles**, **group memberships**, **owned objects**, owners/admins, assigned users/groups, Exchange app access, and sign-in evidence
+- **Per-event sign-in detail** (one report section per enterprise app): time, identity, event type, IP, location, success/failure status, resource, client app
+- **Source-IP intelligence** section: unique sign-in IPs with event counts, which apps used them, reverse DNS, RDAP registrant/network/CIDR/country (subnet-cached)
 - Certificate vs client-secret counts; expired / expiring-in-30-days credentials
 - Redirect / reply URI issues (`http://`, wildcards, localhost)
 - Severity (`High` / `Medium` / `Low`) and human-readable `SecurityNotes`
@@ -236,6 +241,18 @@ Include Exchange app RBAC and a wider sign-in window:
 
 Graph scopes used (delegated): `Application.Read.All`, `Directory.Read.All`, `DelegatedPermissionGrant.Read.All`, `RoleManagement.Read.Directory`, `AuditLog.Read.All`. Use `-SkipSignInActivity` if you lack Entra ID P1, and `-IncludeExchange` (needs the `ExchangeOnlineManagement` module) for Exchange application RBAC / access policies.
 
+Useful switches:
+
+| Switch / param | Effect |
+| --- | --- |
+| `-SignInLookbackDays <n>` | Sign-in window (default 30). Smaller = faster; the `/beta/auditLogs/signIns` store is high-latency. |
+| `-SkipSignInActivity` | Skip all sign-in log queries (also skips per-event detail and IP intelligence). |
+| `-SkipIpIntelligence` | Skip the source-IP RDAP + reverse-DNS pass (the network-bound part) while still collecting sign-ins. |
+| `-IncludeExchange` | Collect Exchange Online application RBAC / access policies (needs `ExchangeOnlineManagement`). |
+| `-ExchangeConnectTimeoutSeconds <n>` | Auto-skip the Exchange connect if sign-in does not complete in time (default 90). |
+| `-IncludeMicrosoftFirstParty` | Include Microsoft first-party inbound apps (excluded by default). |
+| `-ForceReconnect` | Force a fresh Graph sign-in instead of reusing a cached (possibly expired) session. |
+
 ### Outputs
 
 Timestamped folder under `MultiTenantAppAuditOutput\run-yyyyMMdd-HHmmss\`:
@@ -244,9 +261,11 @@ Timestamped folder under `MultiTenantAppAuditOutput\run-yyyyMMdd-HHmmss\`:
 | --- | --- |
 | `multitenant-apps-all.csv` | Combined inventory |
 | `multitenant-apps-outbound.csv` | Multi-tenant app registrations owned here |
-| `multitenant-apps-inbound.csv` | External enterprise apps |
-| `multitenant-apps-report.html` | Dashboard + searchable/sortable inbound & outbound tables with collapsible permission lists |
-| `summary.json` | Counts (severity totals, options used) |
+| `multitenant-apps-inbound.csv` | External enterprise apps (incl. homepage, enabled state, App Gallery status) |
+| `multitenant-apps-signins.csv` | Per-event sign-in detail (time, identity, event type, IP, location, status, resource, client app) |
+| `multitenant-apps-ip-intel.csv` | Unique source IPs with reverse DNS + RDAP registrant/network/CIDR/country |
+| `multitenant-apps-report.html` | Dashboard + searchable/sortable inbound & outbound tables, collapsible permission lists, per-app sign-in sections, and source-IP intelligence |
+| `summary.json` | Counts (severity totals, options used, sign-in events captured, unique source IPs) |
 
 ## Relation to `copilot_audit.ps1`
 
